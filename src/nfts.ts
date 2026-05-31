@@ -77,7 +77,7 @@ export class KiraNFTs {
     return OPENSEA_CHAINS[chain] || "ethereum";
   }
 
-  async getCollection(
+    async getCollection(
     contractAddress: string,
     chain:           string = "ethereum"
   ): Promise<NFTCollection | null> {
@@ -88,26 +88,33 @@ export class KiraNFTs {
     try {
       const chainSlug = this.getChainSlug(chain);
 
-      // Get collection stats
-      const statsRes = await fetch(
-        `${OPENSEA_BASE}/collections/${contractAddress}/stats`,
-        { headers: this.headers(), signal: AbortSignal.timeout(15000) }
-      );
-
-      // Get collection metadata
-      const metaRes = await fetch(
+      // Step 1: resolve contract address to collection slug
+      const contractRes = await fetch(
         `${OPENSEA_BASE}/chain/${chainSlug}/contract/${contractAddress}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
+      if (!contractRes.ok) return null;
+      const contractData = await contractRes.json() as any;
+      const slug = contractData.collection;
+      if (!slug) return null;
 
-      if (!statsRes.ok || !metaRes.ok) return null;
+      // Step 2: fetch collection metadata
+      const metaRes = await fetch(
+        `${OPENSEA_BASE}/collections/${slug}`,
+        { headers: this.headers(), signal: AbortSignal.timeout(15000) }
+      );
+      if (!metaRes.ok) return null;
+      const meta = await metaRes.json() as any;
 
+      // Step 3: fetch stats using slug
+      const statsRes = await fetch(
+        `${OPENSEA_BASE}/collections/${slug}/stats`,
+        { headers: this.headers(), signal: AbortSignal.timeout(15000) }
+      );
+      if (!statsRes.ok) return null;
       const stats = await statsRes.json() as any;
-          const meta  = await metaRes.json() as any;
-          console.log(`OpenSea stats sample:`, JSON.stringify(stats).slice(0, 500));
 
-      const floorEth  = stats.total?.floor_price      || 0;
-      const supply    = stats.total?.num_owners        || 0;
+      const floorEth  = stats.total?.floor_price  || 0;
       const volume24h = stats.intervals?.find(
         (i: any) => i.interval === "one_day"
       )?.volume || 0;
@@ -121,34 +128,36 @@ export class KiraNFTs {
         (i: any) => i.interval === "seven_day"
       )?.sales || 0;
 
-      // Calculate floor change from interval floor prices vs current
-      const intervals     = stats.intervals || [];
-      const day7          = intervals.find((i: any) => i.interval === "seven_day");
-      const day30         = intervals.find((i: any) => i.interval === "thirty_day");
-      const floor7dAgo    = day7?.floor_price  || floorEth;
-      const floor30dAgo   = day30?.floor_price || floorEth;
-      const floor7dChange  = floor7dAgo > 0
+      // Floor change from interval floor prices vs current
+      const intervals    = stats.intervals || [];
+      const day7         = intervals.find((i: any) => i.interval === "seven_day");
+      const day30        = intervals.find((i: any) => i.interval === "thirty_day");
+      const floor7dAgo   = day7?.floor_price  || floorEth;
+      const floor30dAgo  = day30?.floor_price || floorEth;
+      const floor7dChange  = floor7dAgo > 0 && floor7dAgo !== floorEth
         ? ((floorEth - floor7dAgo) / floor7dAgo) * 100 : 0;
-      const floor30dChange = floor30dAgo > 0
+      const floor30dChange = floor30dAgo > 0 && floor30dAgo !== floorEth
         ? ((floorEth - floor30dAgo) / floor30dAgo) * 100 : 0;
-      
+
+      const supply  = meta.total_supply  || 0;
+      const listed  = stats.total?.listed_count || 0;
+
       const collection: NFTCollection = {
         address:        contractAddress.toLowerCase(),
-        name:           meta.name || meta.collection || "Unknown",
+        name:           meta.name || slug,
         chain,
         floorPrice:     floorEth,
-        floorPriceUsd:  floorEth * 2000, // rough proxy — will improve
+        floorPriceUsd:  floorEth * 2000,
         floor7dChange,
         floor30dChange,
         volume24h,
         volume7d,
         sales24h,
         sales7d,
-        holderCount:    stats.total?.num_owners     || 0,
-        totalSupply:    stats.total?.supply         || 0,
-        listedCount:    stats.total?.listed_count   || 0,
-        listingRate:    stats.total?.supply > 0
-          ? (stats.total?.listed_count / stats.total?.supply) * 100 : 0,
+        holderCount:    stats.total?.num_owners  || 0,
+        totalSupply:    supply,
+        listedCount:    listed,
+        listingRate:    supply > 0 ? (listed / supply) * 100 : 0,
         topHolderPct:   0,
         fetchedAt:      Date.now(),
       };
@@ -269,10 +278,12 @@ export class KiraNFTs {
       if (!res.ok) return [];
 
       const data    = await res.json() as any;
-      const results = await Promise.allSettled(
-        (data.collections || []).map((c: any) =>
-          this.getCollection(c.contracts?.[0]?.address || c.collection, chain)
-        )
+            const results = await Promise.allSettled(
+        (data.collections || []).map((c: any) => {
+          const address = c.contracts?.[0]?.address;
+          if (!address) return Promise.resolve(null);
+          return this.getCollection(address, chain);
+        })
       );
 
       return results
