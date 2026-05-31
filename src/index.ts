@@ -92,7 +92,8 @@ interface KiraState {
   toolSummary:        string;
   ecosystemSummary:   string;
   watchlistCount:     number;
-  paperTradeCount:    number;
+    paperTradeCount:    number;
+  lastWalletCheck:    number;
 }
 
 const state: KiraState = {
@@ -113,7 +114,8 @@ const state: KiraState = {
   toolSummary:        "",
   ecosystemSummary:   "",
   watchlistCount:     0,
-  paperTradeCount:    0,
+    paperTradeCount:    0,
+  lastWalletCheck:    0,
 };
 
 // ── MODULES ───────────────────────────────────────────────────────────────────
@@ -421,6 +423,8 @@ IMPORTANT RULES:
 - Watchlist items: ${state.watchlistCount}
 - Paper trades open: ${state.paperTradeCount}
 - DO NOT choose scan_tools if done less than 120 minutes ago
+- DO NOT choose check_wallet if done less than 5 minutes ago
+- Last wallet check: ${state.lastWalletCheck > 0 ? Math.floor((Date.now() - state.lastWalletCheck) / 60000) + " min ago" : "never"}
 - DO NOT choose scan_markets if done less than 120 minutes ago
 - DO NOT choose learning_review unless 30+ days since last review
 - Vary your actions — observe, scan markets, paper trade, check wallets, read docs, sleep
@@ -508,6 +512,7 @@ async function execute(decision: Decision): Promise<void> {
         state.knownWallets[walletToCheck.toLowerCase()] = trust.rating;
         console.log(`Wallet check: ${note}`);
       }
+            state.lastWalletCheck = Date.now();
       await sleep(2 * 60 * 1000);
       break;
 
