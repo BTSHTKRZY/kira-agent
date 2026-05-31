@@ -34,7 +34,7 @@ export const kiraRedis = {
         {
           method:  "POST",
           headers: headers(),
-          body:    JSON.stringify(value),
+          body:    value,
           signal:  AbortSignal.timeout(8000),
         }
       );
@@ -106,7 +106,10 @@ export const kiraRedis = {
     const raw = await kiraRedis.get(key);
     if (!raw) return null;
     try {
-      return JSON.parse(raw) as T;
+      // Handle double-serialized strings
+      const parsed = JSON.parse(raw);
+      if (typeof parsed === "string") return JSON.parse(parsed) as T;
+      return parsed as T;
     } catch {
       return null;
     }
