@@ -6,25 +6,18 @@ export interface TokenPrice {
   symbol:        string;
   chain:         string;
   priceUsd:      number;
-  priceNative:   number;       // price in ETH/native token
-  change1h:      number;       // % change
+  priceNative:   number;
+  change1h:      number;
   change6h:      number;
   change24h:     number;
-  volume24h:     number;       // USD
-  liquidity:     number;       // USD
-  fdv:           number;       // fully diluted valuation
+  volume24h:     number;
+  liquidity:     number;
+  fdv:           number;
   pairAddress:   string;
   dexId:         string;
-  fetchedAt:     number;       // timestamp
+  fetchedAt:     number;
 }
 
-export interface ChainGasPrice {
-  chain:       string;
-  gasPriceGwei: number;
-  fetchedAt:   number;
-}
-
-// DexScreener chain IDs
 const CHAIN_MAP: Record<string, string> = {
   ethereum:  "ethereum",
   base:      "base",
@@ -34,42 +27,31 @@ const CHAIN_MAP: Record<string, string> = {
 };
 
 const DEXSCREENER_BASE = "https://api.dexscreener.com";
-
-// Cache to avoid hammering the API
 const priceCache: Map<string, TokenPrice> = new Map();
-const CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+const CACHE_TTL = 2 * 60 * 1000;
 
 export class KiraPrices {
 
-  // Get price for a token by address on a specific chain
   async getTokenPrice(
     tokenAddress: string,
     chain: string = "base"
   ): Promise<TokenPrice | null> {
     const cacheKey = `${chain}:${tokenAddress.toLowerCase()}`;
     const cached   = priceCache.get(cacheKey);
-
-    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) {
-      return cached;
-    }
+    if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) return cached;
 
     try {
       const chainId = CHAIN_MAP[chain] || chain;
-      const url     = `${DEXSCREENER_BASE}/latest/dex/tokens/${tokenAddress}`;
-      const res     = await fetch(url, {
-        signal: AbortSignal.timeout(10000),
-      });
-
+      const res     = await fetch(
+        `${DEXSCREENER_BASE}/latest/dex/tokens/${tokenAddress}`,
+        { signal: AbortSignal.timeout(10000) }
+      );
       if (!res.ok) return null;
 
-      const data = await res.json() as any;
-      const pairs = (data.pairs || []).filter(
-        (p: any) => p.chainId === chainId
-      );
-
+      const data  = await res.json() as any;
+      const pairs = (data.pairs || []).filter((p: any) => p.chainId === chainId);
       if (!pairs.length) return null;
 
-      // Pick the pair with highest liquidity
       const best = pairs.sort(
         (a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
       )[0];
@@ -78,7 +60,7 @@ export class KiraPrices {
         address:     tokenAddress.toLowerCase(),
         symbol:      best.baseToken?.symbol || "UNKNOWN",
         chain,
-        priceUsd:    parseFloat(best.priceUsd || "0"),
+        priceUsd:    parseFloat(best.priceUsd    || "0"),
         priceNative: parseFloat(best.priceNative || "0"),
         change1h:    best.priceChange?.h1  || 0,
         change6h:    best.priceChange?.h6  || 0,
@@ -100,16 +82,16 @@ export class KiraPrices {
     }
   }
 
-  // Search token by symbol (returns top result)
   async searchToken(
     symbol: string,
-    chain: string = "base"
+    chain:  string = "base"
   ): Promise<TokenPrice | null> {
     try {
       const chainId = CHAIN_MAP[chain] || chain;
-      const url     = `${DEXSCREENER_BASE}/latest/dex/search?q=${encodeURIComponent(symbol)}`;
-      const res     = await fetch(url, { signal: AbortSignal.timeout(10000) });
-
+      const res     = await fetch(
+        `${DEXSCREENER_BASE}/latest/dex/search?q=${encodeURIComponent(symbol)}`,
+        { signal: AbortSignal.timeout(10000) }
+      );
       if (!res.ok) return null;
 
       const data  = await res.json() as any;
@@ -118,7 +100,6 @@ export class KiraPrices {
           p.chainId === chainId &&
           p.baseToken?.symbol?.toUpperCase() === symbol.toUpperCase()
       );
-
       if (!pairs.length) return null;
 
       const best = pairs.sort(
@@ -148,31 +129,25 @@ export class KiraPrices {
     }
   }
 
-  // Get multiple token prices at once (batched)
   async getMultiplePrices(
     tokens: Array<{ address: string; chain: string }>
   ): Promise<TokenPrice[]> {
     const results = await Promise.allSettled(
       tokens.map(t => this.getTokenPrice(t.address, t.chain))
     );
-
     return results
       .filter(r => r.status === "fulfilled" && r.value !== null)
       .map(r => (r as PromiseFulfilledResult<TokenPrice>).value);
   }
 
-  // Check if token has sufficient liquidity for a trade
   hasEnoughLiquidity(price: TokenPrice, tradeAmountEth: number = 0.005): boolean {
-    // Require at least 20x the trade size in liquidity to avoid slippage
-    const ethPriceUsd   = price.priceUsd / price.priceNative;
+    const ethPriceUsd    = price.priceUsd / price.priceNative;
     const tradeAmountUsd = tradeAmountEth * ethPriceUsd;
     return price.liquidity > tradeAmountUsd * 20;
   }
 
-  // Momentum signal: is this token trending up?
   getMomentumSignal(price: TokenPrice): "strong_up" | "up" | "neutral" | "down" | "strong_down" {
     const { change1h, change6h, change24h } = price;
-
     if (change1h > 5  && change6h > 10 && change24h > 20) return "strong_up";
     if (change1h > 2  && change6h > 5)                    return "up";
     if (change1h < -5 && change6h < -10)                  return "strong_down";
@@ -180,9 +155,7 @@ export class KiraPrices {
     return "neutral";
   }
 
-  // Format price data for KIRA's context/decision engine
   formatForContext(price: TokenPrice): string {
-    const momentum = this.getMomentumSignal(price);
     return [
       `${price.symbol} (${price.chain}):`,
       `$${price.priceUsd.toFixed(6)}`,
@@ -190,11 +163,10 @@ export class KiraPrices {
       `24h: ${price.change24h > 0 ? "+" : ""}${price.change24h.toFixed(1)}%`,
       `Vol: $${(price.volume24h / 1000).toFixed(1)}k`,
       `Liq: $${(price.liquidity / 1000).toFixed(1)}k`,
-      `Signal: ${momentum}`,
+      `Signal: ${this.getMomentumSignal(price)}`,
     ].join(" | ");
   }
 
-  // Get ETH price in USD (for gas cost calculations)
   async getEthPrice(): Promise<number> {
     try {
       const res  = await fetch(
@@ -203,9 +175,7 @@ export class KiraPrices {
       );
       const data = await res.json() as any;
       const pair = (data.pairs || []).find(
-        (p: any) =>
-          p.chainId === "ethereum" &&
-          p.baseToken?.symbol === "WETH"
+        (p: any) => p.chainId === "ethereum" && p.baseToken?.symbol === "WETH"
       );
       return pair ? parseFloat(pair.priceUsd || "0") : 0;
     } catch {
