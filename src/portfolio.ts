@@ -236,14 +236,16 @@ export class KiraPortfolio {
     await kiraRedis.setJson(K.watchItem(key), item);
   }
 
-  async getWatchlist(): Promise<WatchlistItem[]> {
+    async getWatchlist(): Promise<WatchlistItem[]> {
     const keys = await kiraRedis.smembers(K.watchlist());
     if (!keys.length) return [];
     const items = await Promise.all(
       keys.map(k => kiraRedis.getJson<WatchlistItem>(K.watchItem(k)))
     );
-    return (items.filter(Boolean) as WatchlistItem[])
-      .sort((a, b) => b.lastScore - a.lastScore);
+    const valid = (items.filter(
+      item => item !== null && item !== undefined && item.name
+    ) as WatchlistItem[]);
+    return valid.sort((a, b) => b.lastScore - a.lastScore);
   }
 
   async removeFromWatchlist(key: string): Promise<void> {
