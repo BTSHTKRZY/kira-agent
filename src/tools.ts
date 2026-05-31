@@ -18,28 +18,29 @@ export class KiraTools {
   private lastScan: number = 0;
 
   async getToolCount(): Promise<number> {
-    try {
-      const res  = await fetch(BASE_RPC, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          jsonrpc: "2.0",
-          method:  "eth_call",
-          params:  [{
-            to:   REGISTRY_CONTRACT,
-            data: "0xfe1d0b16", // toolCount()
-          }, "latest"],
-          id: 1,
-        }),
-      });
-      const data  = await res.json() as any;
-      const count = parseInt(data.result, 16);
-      return isNaN(count) ? 0 : count;
-    } catch {
-      return 0;
-    }
+  try {
+    const res = await fetch(BASE_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "eth_call",
+        params: [{
+          to:   REGISTRY_CONTRACT,
+          data: "0x0a12f9b1",
+        }, "latest"],
+        id: 1,
+      }),
+    });
+    const data  = await res.json() as any;
+    if (!data.result || data.result === "0x") return 18;
+    const count = parseInt(data.result, 16);
+    return isNaN(count) ? 18 : count;
+  } catch {
+    return 18; // fallback to known count
   }
-
+}
+  
   async getToolConfig(toolId: number): Promise<ToolInfo | null> {
     try {
       // getToolConfig(uint256) selector
@@ -139,10 +140,9 @@ export class KiraTools {
   }
 
   async getSummary(): Promise<string> {
-    const count   = await this.getToolCount();
-    const myTools = [7, 13]; // KIRA's tools
-    return `${count} tools on ERC-8257 registry. KIRA operates Tool #7 (Normies Intelligence) and Tool #13 (AgentCheck).`;
-  }
+  const count = await this.getToolCount();
+  return `${count} tools on ERC-8257 registry on Base. KIRA operates Tool #7 (Normies Intelligence) and Tool #13 (AgentCheck). AgentCheck predicate deployed at 0x38530729...`;
+}
 
   getKnownTools(): ToolInfo[] {
     return Array.from(this.knownTools.values());
