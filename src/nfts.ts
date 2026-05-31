@@ -120,12 +120,16 @@ export class KiraNFTs {
         (i: any) => i.interval === "seven_day"
       )?.sales || 0;
 
-      // Floor change from interval stats
-      const intervals      = stats.intervals || [];
-      const day7           = intervals.find((i: any) => i.interval === "seven_day");
-      const day30          = intervals.find((i: any) => i.interval === "thirty_day");
-      const floor7dChange  = day7?.floor_price_percentage_change  || 0;
-      const floor30dChange = day30?.floor_price_percentage_change || 0;
+      // Calculate floor change from interval floor prices vs current
+      const intervals     = stats.intervals || [];
+      const day7          = intervals.find((i: any) => i.interval === "seven_day");
+      const day30         = intervals.find((i: any) => i.interval === "thirty_day");
+      const floor7dAgo    = day7?.floor_price  || floorEth;
+      const floor30dAgo   = day30?.floor_price || floorEth;
+      const floor7dChange  = floor7dAgo > 0
+        ? ((floorEth - floor7dAgo) / floor7dAgo) * 100 : 0;
+      const floor30dChange = floor30dAgo > 0
+        ? ((floorEth - floor30dAgo) / floor30dAgo) * 100 : 0;
       
       const collection: NFTCollection = {
         address:        contractAddress.toLowerCase(),
