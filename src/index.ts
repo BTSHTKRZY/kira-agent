@@ -244,14 +244,14 @@ async function executePaperTrade(): Promise<void> {
     return;
   }
 
-   const mockScore = {
+     const mockScore = {
     collection:  candidate.address,
     address:     candidate.address,
     symbol:      candidate.symbol || "",
     chain:       candidate.chain,
     totalScore:  candidate.lastScore,
     thesis:      candidate.thesis,
-    signals:     candidate.signals,
+    signals:     candidate.signals as any,
     decision:    "buy" as const,
     confidence:  "medium" as const,
     scoredAt:    candidate.scoredAt,
