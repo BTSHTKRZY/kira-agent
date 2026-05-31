@@ -24,6 +24,7 @@ export interface NFTSignals {
   knownWalletBuying:  number;
   volumeRecovery:     number;
   washTradeClean:     number;
+  [key: string]:      number;
 }
 
 export interface TokenScore {
@@ -44,6 +45,7 @@ export interface TokenSignals {
   volumeTrend:       number;
   liquidityDepth:    number;
   normiesWalletFlow: number;
+  [key: string]:     number;
 }
 
 export interface SignalWeights {
