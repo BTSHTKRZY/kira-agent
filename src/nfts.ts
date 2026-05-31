@@ -120,10 +120,13 @@ export class KiraNFTs {
         (i: any) => i.interval === "seven_day"
       )?.sales || 0;
 
-      // Floor change: approximate from volume trends
-      const floor7dChange  = 0; // OpenSea doesn't provide direct % change — will enrich later
-      const floor30dChange = 0;
-
+      // Floor change from interval stats
+      const intervals      = stats.intervals || [];
+      const day7           = intervals.find((i: any) => i.interval === "seven_day");
+      const day30          = intervals.find((i: any) => i.interval === "thirty_day");
+      const floor7dChange  = day7?.floor_price_percentage_change  || 0;
+      const floor30dChange = day30?.floor_price_percentage_change || 0;
+      
       const collection: NFTCollection = {
         address:        contractAddress.toLowerCase(),
         name:           meta.name || meta.collection || "Unknown",
