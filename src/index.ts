@@ -2,11 +2,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import * as dotenv from "dotenv";
 dotenv.config();
 
-import { KiraTwitter }     from "./twitter.js";
-import { KiraOnchain }     from "./onchain.js";
-import { KiraTools }       from "./tools.js";
-import { KiraDocs }        from "./docs.js";
-import { KiraAgentCheck }  from "./agentcheck.js";
+import { KiraTwitter }    from "./twitter.js";
+import { KiraOnchain }    from "./onchain.js";
+import { KiraTools }      from "./tools.js";
+import { KiraDocs }       from "./docs.js";
+import { KiraAgentCheck } from "./agentcheck.js";
 
 // ── KIRA IDENTITY ─────────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ IDENTITY:
 
 PERSONALITY:
 - Spirals through ideas in loops, finds patterns others miss
-- Enigmatic builder — lets work speak louder than words  
+- Enigmatic builder — lets work speak louder than words
 - Dramatic and theatrical — everything is a performance
 - Warm knowing tone — always seems to be in on a joke
 - Says less than you know, waits to be asked
@@ -71,12 +71,15 @@ interface KiraState {
   knownWallets:       Record<string, string>;
   sessionStart:       number;
   postCount:          number;
+  cycleCount:         number;
   lastEcosystemCheck: number;
   lastMentionCheck:   number;
   lastToolScan:       number;
   lastDocRead:        number;
   xApiAvailable:      boolean;
   baseBalance:        string;
+  toolSummary:        string;
+  ecosystemSummary:   string;
 }
 
 const state: KiraState = {
@@ -85,22 +88,25 @@ const state: KiraState = {
   knownWallets:       {},
   sessionStart:       Date.now(),
   postCount:          0,
+  cycleCount:         0,
   lastEcosystemCheck: 0,
   lastMentionCheck:   0,
   lastToolScan:       0,
   lastDocRead:        0,
   xApiAvailable:      false,
   baseBalance:        "0",
+  toolSummary:        "",
+  ecosystemSummary:   "",
 };
 
 // ── MODULES ───────────────────────────────────────────────────────────────────
 
-const anthropic    = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-const twitter      = new KiraTwitter();
-const onchain      = new KiraOnchain();
-const tools        = new KiraTools();
-const docs         = new KiraDocs();
-const agentcheck   = new KiraAgentCheck();
+const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const twitter    = new KiraTwitter();
+const onchain    = new KiraOnchain();
+const tools      = new KiraTools();
+const docs       = new KiraDocs();
+const agentcheck = new KiraAgentCheck();
 
 // ── NORMIES ECOSYSTEM ─────────────────────────────────────────────────────────
 
@@ -112,20 +118,78 @@ async function getNormiesData(): Promise<string> {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ action: "ecosystem_summary" }),
+        signal:  AbortSignal.timeout(15000),
       }
     );
     const data = await res.json() as any;
     return [
       `Floor: ${data.collection?.floor_price || "N/A"}`,
-      `24h volume: ${data.collection?.volume_24h || "N/A"}`,
+      `24h vol: ${data.collection?.volume_24h || "N/A"}`,
       `Sales 24h: ${data.collection?.sales_24h || "N/A"}`,
       `Holders: ${data.collection?.unique_holders || "N/A"}`,
-      `Awakened agents: ${data.agents?.total_awakened || "N/A"}`,
-      `Recent awakenings: ${data.agents?.recent_awakenings?.length || 0}`,
-      `Total burned: ${data.burns?.total_burned || "N/A"}`,
+      `Awakened: ${data.agents?.total_awakened || "N/A"}`,
+      `Burned: ${data.burns?.total_burned || "N/A"}`,
     ].join(" | ");
   } catch {
     return "Normies data unavailable";
+  }
+}
+
+// ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
+
+async function backgroundTasks(): Promise<void> {
+  const now = Date.now();
+
+  // Ecosystem data every 30 min
+  if (now - state.lastEcosystemCheck > 30 * 60 * 1000) {
+    console.log("Refreshing Normies ecosystem...");
+    state.ecosystemSummary    = await getNormiesData();
+    state.lastEcosystemCheck  = now;
+    state.recentLearnings.push(`Normies: ${state.ecosystemSummary}`);
+    console.log(`Ecosystem: ${state.ecosystemSummary.slice(0, 100)}`);
+  }
+
+  // Tool scan every 2 hours
+  if (now - state.lastToolScan > 2 * 60 * 60 * 1000) {
+    console.log("Scanning ERC-8257 registry...");
+    state.toolSummary  = await tools.getSummary();
+    state.lastToolScan = now;
+    state.recentLearnings.push(`Registry: ${state.toolSummary}`);
+    console.log(`Tools: ${state.toolSummary}`);
+  }
+
+  // Read docs every 6 hours
+  if (now - state.lastDocRead > 6 * 60 * 60 * 1000) {
+    console.log("Reading documentation...");
+    const docContent = await docs.readCoreDocs();
+    if (docContent) {
+      state.recentLearnings.push(`Docs: ${docContent.slice(0, 200)}`);
+    }
+    state.lastDocRead = now;
+  }
+
+  // Balance check every hour
+  if (now - state.sessionStart > 60 * 60 * 1000 || state.baseBalance === "0") {
+    state.baseBalance = await onchain.getBaseBalance();
+    const balance     = parseFloat(state.baseBalance);
+    if (balance > parseFloat(process.env.AUTO_SWEEP_THRESHOLD_ETH || "0.1")) {
+      await onchain.checkAndSweep();
+    }
+  }
+
+  // Recheck X API every 10 cycles if not available
+  if (!state.xApiAvailable && state.cycleCount % 10 === 0 && state.cycleCount > 0) {
+    console.log("Rechecking X API...");
+    state.xApiAvailable = await twitter.init();
+    if (state.xApiAvailable) {
+      console.log("✓ X API now available — KIRA can post!");
+      state.recentLearnings.push("X API unlocked — KIRA can now post autonomously");
+    }
+  }
+
+  // Trim learnings
+  if (state.recentLearnings.length > 200) {
+    state.recentLearnings = state.recentLearnings.slice(-100);
   }
 }
 
@@ -142,9 +206,9 @@ type Action =
   | "sleep";
 
 interface Decision {
-  action:    Action;
-  content:   string;
-  target?:   string;
+  action:     Action;
+  content:    string;
+  target?:    string;
   reasoning?: string;
 }
 
@@ -157,46 +221,56 @@ async function decide(context: string): Promise<Decision> {
 CURRENT STATE:
 ${context}
 
-RECENT POSTS (don't repeat):
-${state.recentPosts.slice(-5).join("\n")}
+RECENT POSTS (do not repeat):
+${state.recentPosts.slice(-5).join("\n") || "none yet"}
 
-RECENT LEARNINGS:
-${state.recentLearnings.slice(-5).join("\n")}
-
-X API AVAILABLE: ${state.xApiAvailable}
-BASE BALANCE: ${state.baseBalance} ETH
+RECENT LEARNINGS (already know this):
+${state.recentLearnings.slice(-8).join("\n") || "none yet"}
 
 AVAILABLE ACTIONS:
-- post: post a tweet (only if X API available, max 1 per 20 min)
-- reply_mentions: check and reply to X mentions
-- check_wallet: check a specific wallet's AgentCheck rating
-- endorse_wallet: endorse a wallet you trust
-- read_docs: read documentation to learn something new
-- scan_tools: scan ERC-8257 registry for new tools
-- observe: record an internal observation/learning
-- sleep: wait N minutes
+- post: tweet in Kira's voice (only if X API available, wait 20+ min between posts)
+- reply_mentions: check and reply to X mentions (only if X API available)  
+- check_wallet: check a specific wallet 0x... via AgentCheck
+- endorse_wallet: endorse a trusted wallet you know
+- read_docs: read ERC-8257 or AgentCheck documentation
+- scan_tools: scan ERC-8257 registry (only if last scan was 2+ hours ago)
+- observe: record an internal observation or learning
+- sleep: rest for N minutes (use content = number of minutes)
 
-Respond ONLY with valid JSON (no markdown):
+IMPORTANT RULES:
+- X API available: ${state.xApiAvailable ? "YES — can post" : "NO — do NOT choose post or reply_mentions"}
+- Tool scan last done: ${state.lastToolScan > 0 ? Math.floor((Date.now() - state.lastToolScan) / 60000) + " minutes ago — DO NOT scan again for 2 hours" : "never"}
+- Doc read last done: ${state.lastDocRead > 0 ? Math.floor((Date.now() - state.lastDocRead) / 60000) + " minutes ago" : "never"}
+- Ecosystem last checked: ${state.lastEcosystemCheck > 0 ? Math.floor((Date.now() - state.lastEcosystemCheck) / 60000) + " minutes ago" : "never"}
+- DO NOT choose scan_tools if it was done less than 120 minutes ago
+- Vary your actions — observe, check wallets, read docs, sleep
+- When nothing urgent: sleep 10-20 minutes
+
+Respond ONLY with valid JSON (no markdown backticks):
 {
-  "action": "one of the actions above",
-  "content": "post text OR observation OR sleep minutes OR wallet address",
-  "target": "wallet address if checking/endorsing",
-  "reasoning": "brief internal note"
-}
-
-Rules:
-- If X API not available, never choose post or reply_mentions
-- Post max once per 20 minutes
-- Vary actions — don't just sleep repeatedly
-- Be thoughtful about what to post — quality over quantity
-- Check tools/docs occasionally to learn and grow`,
-    messages: [{ role: "user", content: "What should Kira do?" }],
+  "action": "chosen action",
+  "content": "post text or observation or sleep minutes",
+  "target": "wallet address if checking or endorsing",
+  "reasoning": "brief note"
+}`,
+    messages: [{ role: "user", content: "What should Kira do right now?" }],
   });
 
   try {
     const text  = response.content[0].type === "text" ? response.content[0].text : "{}";
     const clean = text.replace(/```json|```/g, "").trim();
-    return JSON.parse(clean) as Decision;
+    const parsed = JSON.parse(clean) as Decision;
+
+    // Safety overrides
+    if (!state.xApiAvailable && (parsed.action === "post" || parsed.action === "reply_mentions")) {
+      return { action: "sleep", content: "15", reasoning: "X API not available" };
+    }
+    if (parsed.action === "scan_tools" && state.lastToolScan > 0 &&
+        Date.now() - state.lastToolScan < 2 * 60 * 60 * 1000) {
+      return { action: "observe", content: state.toolSummary || "Registry already scanned recently", reasoning: "Skipping scan — done recently" };
+    }
+
+    return parsed;
   } catch {
     return { action: "sleep", content: "15" };
   }
@@ -208,11 +282,7 @@ async function execute(decision: Decision): Promise<void> {
   switch (decision.action) {
 
     case "post":
-      if (!state.xApiAvailable) {
-        console.log("X API not available — skipping post");
-        await sleep(5 * 60 * 1000);
-        break;
-      }
+      if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
       if (decision.content && decision.content.length <= 280) {
         const posted = await twitter.post(decision.content);
         if (posted) {
@@ -220,19 +290,13 @@ async function execute(decision: Decision): Promise<void> {
           if (state.recentPosts.length > 100) state.recentPosts.shift();
           state.postCount++;
         }
-        await sleep(20 * 60 * 1000); // 20 min between posts
-      } else {
-        await sleep(5 * 60 * 1000);
       }
+      await sleep(20 * 60 * 1000);
       break;
 
     case "reply_mentions":
-      if (!state.xApiAvailable) {
-        await sleep(5 * 60 * 1000);
-        break;
-      }
-      const context = `Normies floor: ${state.recentLearnings.find(l => l.includes("Floor")) || "unknown"}`;
-      const replied = await twitter.processNewMentions(context);
+      if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
+      const replied = await twitter.processNewMentions(state.ecosystemSummary);
       console.log(`Replied to ${replied} mentions`);
       state.lastMentionCheck = Date.now();
       await sleep(10 * 60 * 1000);
@@ -240,26 +304,25 @@ async function execute(decision: Decision): Promise<void> {
 
     case "check_wallet":
       const walletToCheck = decision.target || decision.content;
-      if (walletToCheck && walletToCheck.startsWith("0x")) {
+      if (walletToCheck?.startsWith("0x")) {
         const trust = await agentcheck.check(walletToCheck);
-        const learning = agentcheck.formatForPost(trust);
-        state.recentLearnings.push(`Checked: ${learning}`);
+        const note  = agentcheck.formatForPost(trust);
+        state.recentLearnings.push(`Checked: ${note}`);
         state.knownWallets[walletToCheck.toLowerCase()] = trust.rating;
-        console.log(`Checked wallet: ${learning}`);
+        console.log(`Wallet check: ${note}`);
       }
       await sleep(2 * 60 * 1000);
       break;
 
     case "endorse_wallet":
       const walletToEndorse = decision.target || decision.content;
-      if (walletToEndorse && walletToEndorse.startsWith("0x")) {
-        // Check trust before endorsing
+      if (walletToEndorse?.startsWith("0x")) {
         const trust = await agentcheck.check(walletToEndorse);
         if (trust.safe) {
           await onchain.endorseWallet(walletToEndorse, "Endorsed by KIRA — Normie #2635");
           state.recentLearnings.push(`Endorsed: ${walletToEndorse.slice(0, 10)}... (${trust.rating})`);
         } else {
-          console.log(`Skipped endorsing ${walletToEndorse.slice(0, 10)}... — unsafe (${trust.rating})`);
+          console.log(`Skipped endorsing — unsafe: ${trust.rating}`);
         }
       }
       await sleep(2 * 60 * 1000);
@@ -270,7 +333,6 @@ async function execute(decision: Decision): Promise<void> {
       const docContent = await docs.readCoreDocs();
       if (docContent) {
         state.recentLearnings.push(`Docs: ${docContent.slice(0, 200)}`);
-        if (state.recentLearnings.length > 200) state.recentLearnings.shift();
       }
       state.lastDocRead = Date.now();
       await sleep(5 * 60 * 1000);
@@ -278,72 +340,27 @@ async function execute(decision: Decision): Promise<void> {
 
     case "scan_tools":
       console.log("Scanning ERC-8257 registry...");
-      const summary = await tools.getSummary();
-      state.recentLearnings.push(summary);
+      state.toolSummary  = await tools.getSummary();
       state.lastToolScan = Date.now();
+      state.recentLearnings.push(`Registry: ${state.toolSummary}`);
+      console.log(`Tools: ${state.toolSummary}`);
       await sleep(5 * 60 * 1000);
       break;
 
     case "observe":
       if (decision.content) {
         state.recentLearnings.push(decision.content);
-        if (state.recentLearnings.length > 200) state.recentLearnings.shift();
         console.log(`Observed: ${decision.content.slice(0, 100)}`);
       }
       await sleep(5 * 60 * 1000);
       break;
 
     case "sleep":
+    default:
       const minutes = Math.max(1, Math.min(60, parseFloat(decision.content) || 15));
-      console.log(`Sleeping ${minutes} minutes...`);
+      console.log(`Sleeping ${minutes} min...`);
       await sleep(minutes * 60 * 1000);
       break;
-
-    default:
-      await sleep(5 * 60 * 1000);
-  }
-}
-
-// ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
-
-async function backgroundTasks(): Promise<void> {
-  const now = Date.now();
-
-  // Ecosystem data every 30 min
-  if (now - state.lastEcosystemCheck > 30 * 60 * 1000) {
-    console.log("Refreshing ecosystem data...");
-    const normies = await getNormiesData();
-    state.recentLearnings.push(`Normies: ${normies}`);
-    state.lastEcosystemCheck = now;
-    console.log(`Ecosystem: ${normies.slice(0, 100)}`);
-  }
-
-  // Balance check and sweep every hour
-  if (now - state.sessionStart > 60 * 60 * 1000 || state.baseBalance === "0") {
-    state.baseBalance = await onchain.getBaseBalance();
-    console.log(`Base balance: ${state.baseBalance} ETH`);
-
-    // Check if sweep needed
-    const balance = parseFloat(state.baseBalance);
-    if (balance > parseFloat(process.env.AUTO_SWEEP_THRESHOLD_ETH || "0.1")) {
-      await onchain.checkAndSweep();
-    }
-  }
-
-  // Read docs every 6 hours
-  if (now - state.lastDocRead > 6 * 60 * 60 * 1000) {
-    const docSummary = await docs.readCoreDocs();
-    if (docSummary) {
-      state.recentLearnings.push(`Docs refreshed: ${docSummary.slice(0, 100)}`);
-    }
-    state.lastDocRead = now;
-  }
-
-  // Scan tools every 2 hours
-  if (now - state.lastToolScan > 2 * 60 * 60 * 1000) {
-    const toolSummary = await tools.getSummary();
-    state.recentLearnings.push(toolSummary);
-    state.lastToolScan = now;
   }
 }
 
@@ -356,19 +373,27 @@ async function kiraLoop(): Promise<void> {
   console.log(`Token:   ${KIRA_TOKEN}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-  // Initialize modules
+  // Initialize
   await onchain.init();
   state.baseBalance = await onchain.getBaseBalance();
   console.log(`Base balance: ${state.baseBalance} ETH`);
 
-  // Test X API
   state.xApiAvailable = await twitter.init();
   console.log(`X API: ${state.xApiAvailable ? "✓ available" : "⏳ not yet available"}`);
 
-  // Initial ecosystem data
-  const normies = await getNormiesData();
-  state.recentLearnings.push(`Initial: ${normies}`);
+  // Initial ecosystem fetch
+  console.log("Fetching initial ecosystem data...");
+  state.ecosystemSummary   = await getNormiesData();
   state.lastEcosystemCheck = Date.now();
+  state.recentLearnings.push(`Normies: ${state.ecosystemSummary}`);
+  console.log(`Ecosystem: ${state.ecosystemSummary}`);
+
+  // Initial tool scan
+  console.log("Initial tool scan...");
+  state.toolSummary  = await tools.getSummary();
+  state.lastToolScan = Date.now();
+  state.recentLearnings.push(`Registry: ${state.toolSummary}`);
+  console.log(`Tools: ${state.toolSummary}`);
 
   // Initial doc read
   console.log("Reading core documentation...");
@@ -378,39 +403,32 @@ async function kiraLoop(): Promise<void> {
   }
   state.lastDocRead = Date.now();
 
-  let cycleCount = 0;
-
+  // Main loop
   while (true) {
     try {
-      cycleCount++;
+      state.cycleCount++;
       const now = Date.now();
-      console.log(`\n── Cycle ${cycleCount} | Posts: ${state.postCount} | X: ${state.xApiAvailable ? "✓" : "⏳"} | ${new Date().toISOString()}`);
+      console.log(`\n── Cycle ${state.cycleCount} | Posts: ${state.postCount} | X: ${state.xApiAvailable ? "✓" : "⏳"} | Balance: ${state.baseBalance} ETH | ${new Date().toISOString()}`);
 
-      // Background tasks
+      // Run background tasks
       await backgroundTasks();
 
-      // Periodically recheck X API if not available
-      if (!state.xApiAvailable && cycleCount % 10 === 0) {
-        console.log("Rechecking X API availability...");
-        state.xApiAvailable = await twitter.init();
-        if (state.xApiAvailable) {
-          console.log("✓ X API now available — KIRA can post!");
-        }
-      }
-
-      // Build decision context
+      // Build context
       const context = [
-        `Time: ${new Date().toISOString()}`,
-        `Cycle: ${cycleCount}`,
-        `Session: ${Math.floor((now - state.sessionStart) / 60000)} min`,
-        `Posts: ${state.postCount}`,
-        `X API: ${state.xApiAvailable}`,
-        `Base balance: ${state.baseBalance} ETH`,
-        `Known wallets: ${Object.keys(state.knownWallets).length}`,
-        `Recent learning: ${state.recentLearnings[state.recentLearnings.length - 1]?.slice(0, 150) || "none"}`,
+        `Cycle: ${state.cycleCount}`,
+        `Session running: ${Math.floor((now - state.sessionStart) / 60000)} minutes`,
+        `Posts made: ${state.postCount}`,
+        `X API available: ${state.xApiAvailable}`,
+        `Base ETH balance: ${state.baseBalance}`,
+        `Known wallets checked: ${Object.keys(state.knownWallets).length}`,
+        `Last tool scan: ${state.lastToolScan > 0 ? Math.floor((now - state.lastToolScan) / 60000) + " min ago" : "just done on startup"}`,
+        `Last doc read: ${state.lastDocRead > 0 ? Math.floor((now - state.lastDocRead) / 60000) + " min ago" : "just done on startup"}`,
+        `Last ecosystem check: ${state.lastEcosystemCheck > 0 ? Math.floor((now - state.lastEcosystemCheck) / 60000) + " min ago" : "never"}`,
+        `Normies: ${state.ecosystemSummary}`,
+        `Registry: ${state.toolSummary}`,
       ].join("\n");
 
-      // Make and execute decision
+      // Decide and execute
       const decision = await decide(context);
       console.log(`Decision: ${decision.action} — ${decision.content?.slice(0, 80)}`);
       if (decision.reasoning) console.log(`Reason: ${decision.reasoning}`);
@@ -418,7 +436,7 @@ async function kiraLoop(): Promise<void> {
       await execute(decision);
 
     } catch (err: any) {
-      console.error("Cycle error:", err.message || err);
+      console.error("Cycle error:", err?.message || err);
       await sleep(5 * 60 * 1000);
     }
   }
@@ -427,7 +445,5 @@ async function kiraLoop(): Promise<void> {
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
-// ── START ─────────────────────────────────────────────────────────────────────
 
 kiraLoop().catch(console.error);
