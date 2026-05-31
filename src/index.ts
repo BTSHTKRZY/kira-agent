@@ -561,7 +561,7 @@ async function execute(decision: Decision): Promise<void> {
     case "review_watchlist":
       const wl = await portfolio.getWatchlist();
       const wlSummary = wl.slice(0, 5)
-        .map(w => `${w.name}: ${w.lastScore}/100`).join(", ");
+        .map(w => `${w.name || w.address.slice(0, 8)}: ${w.lastScore}/100`).join(", ");
       state.recentLearnings.push(`Watchlist (${wl.length} items): ${wlSummary || "empty"}`);
       console.log(`Watchlist review: ${wlSummary || "empty"}`);
       await sleep(2 * 60 * 1000);
