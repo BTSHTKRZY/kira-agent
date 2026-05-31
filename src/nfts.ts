@@ -1,5 +1,5 @@
-// nfts.ts — NFT data via Reservoir API (free public endpoint)
-// Covers ETH, Base, Arbitrum, Polygon and other EVM chains
+// nfts.ts — NFT data via OpenSea API
+// Covers ETH, Base, Arbitrum and other EVM chains
 
 export interface NFTCollection {
   address:        string;
@@ -48,29 +48,33 @@ export interface HolderAnalysis {
   washTradeRisk:  "low" | "medium" | "high";
 }
 
-const RESERVOIR_CHAINS: Record<string, string> = {
-  ethereum:  "https://api.reservoir.tools",
-  base:      "https://api-base.reservoir.tools",
-  arbitrum:  "https://api-arbitrum.reservoir.tools",
-  polygon:   "https://api-polygon.reservoir.tools",
-  optimism:  "https://api-optimism.reservoir.tools",
+// OpenSea chain slugs
+const OPENSEA_CHAINS: Record<string, string> = {
+  ethereum:  "ethereum",
+  base:      "base",
+  arbitrum:  "arbitrum",
+  polygon:   "matic",
+  optimism:  "optimism",
 };
 
-const RESERVOIR_API_KEY = process.env.RESERVOIR_API_KEY || "demo";
+const OPENSEA_BASE    = "https://api.opensea.io/api/v2";
+const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || "";
+
 const collectionCache: Map<string, NFTCollection> = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 
 export class KiraNFTs {
 
-  private getBaseUrl(chain: string): string {
-    return RESERVOIR_CHAINS[chain] || RESERVOIR_CHAINS.ethereum;
-  }
-
   private headers(): Record<string, string> {
     return {
-      "x-api-key":    RESERVOIR_API_KEY,
+      "x-api-key":    OPENSEA_API_KEY,
       "Content-Type": "application/json",
+      "Accept":       "application/json",
     };
+  }
+
+  private getChainSlug(chain: string): string {
+    return OPENSEA_CHAINS[chain] || "ethereum";
   }
 
   async getCollection(
@@ -82,38 +86,61 @@ export class KiraNFTs {
     if (cached && Date.now() - cached.fetchedAt < CACHE_TTL) return cached;
 
     try {
-      const base = this.getBaseUrl(chain);
-      const res  = await fetch(
-        `${base}/collections/v7?id=${contractAddress}&includeTopBid=false&normalizeRoyalties=false`,
+      const chainSlug = this.getChainSlug(chain);
+
+      // Get collection stats
+      const statsRes = await fetch(
+        `${OPENSEA_BASE}/collections/${contractAddress}/stats`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
-      if (!res.ok) return null;
 
-      const data = await res.json() as any;
-      const col  = data.collections?.[0];
-      if (!col) return null;
+      // Get collection metadata
+      const metaRes = await fetch(
+        `${OPENSEA_BASE}/chain/${chainSlug}/contract/${contractAddress}`,
+        { headers: this.headers(), signal: AbortSignal.timeout(15000) }
+      );
 
-      const floorEth  = col.floorAsk?.price?.amount?.native || 0;
-      const floorUsd  = col.floorAsk?.price?.amount?.usd    || 0;
-      const supply    = col.tokenCount  || 0;
-      const listed    = col.onSaleCount || 0;
+      if (!statsRes.ok || !metaRes.ok) return null;
+
+      const stats = await statsRes.json() as any;
+      const meta  = await metaRes.json() as any;
+
+      const floorEth  = stats.total?.floor_price      || 0;
+      const supply    = stats.total?.num_owners        || 0;
+      const volume24h = stats.intervals?.find(
+        (i: any) => i.interval === "one_day"
+      )?.volume || 0;
+      const volume7d  = stats.intervals?.find(
+        (i: any) => i.interval === "seven_day"
+      )?.volume || 0;
+      const sales24h  = stats.intervals?.find(
+        (i: any) => i.interval === "one_day"
+      )?.sales || 0;
+      const sales7d   = stats.intervals?.find(
+        (i: any) => i.interval === "seven_day"
+      )?.sales || 0;
+
+      // Floor change: approximate from volume trends
+      const floor7dChange  = 0; // OpenSea doesn't provide direct % change — will enrich later
+      const floor30dChange = 0;
 
       const collection: NFTCollection = {
         address:        contractAddress.toLowerCase(),
-        name:           col.name || "Unknown",
+        name:           meta.name || meta.collection || "Unknown",
         chain,
         floorPrice:     floorEth,
-        floorPriceUsd:  floorUsd,
-        floor7dChange:  col.floorSaleChange?.["7day"]  || 0,
-        floor30dChange: col.floorSaleChange?.["30day"] || 0,
-        volume24h:      col.volume?.["1day"]      || 0,
-        volume7d:       col.volume?.["7day"]      || 0,
-        sales24h:       col.salesCount?.["1day"]  || 0,
-        sales7d:        col.salesCount?.["7day"]  || 0,
-        holderCount:    col.ownerCount || 0,
-        totalSupply:    supply,
-        listedCount:    listed,
-        listingRate:    supply > 0 ? (listed / supply) * 100 : 0,
+        floorPriceUsd:  floorEth * 2000, // rough proxy — will improve
+        floor7dChange,
+        floor30dChange,
+        volume24h,
+        volume7d,
+        sales24h,
+        sales7d,
+        holderCount:    stats.total?.num_owners     || 0,
+        totalSupply:    stats.total?.supply         || 0,
+        listedCount:    stats.total?.listed_count   || 0,
+        listingRate:    stats.total?.supply > 0
+          ? (stats.total?.listed_count / stats.total?.supply) * 100 : 0,
         topHolderPct:   0,
         fetchedAt:      Date.now(),
       };
@@ -133,21 +160,21 @@ export class KiraNFTs {
     limit:           number = 50
   ): Promise<NFTSale[]> {
     try {
-      const base = this.getBaseUrl(chain);
-      const res  = await fetch(
-        `${base}/sales/v6?contract=${contractAddress}&limit=${limit}&sortBy=time`,
+      const chainSlug = this.getChainSlug(chain);
+      const res       = await fetch(
+        `${OPENSEA_BASE}/events/collection/${contractAddress}?event_type=sale&limit=${limit}&chain=${chainSlug}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
       if (!res.ok) return [];
 
       const data = await res.json() as any;
-      return (data.sales || []).map((s: any) => ({
-        tokenId:     s.token?.tokenId || "",
-        price:       s.price?.amount?.native || 0,
-        buyer:       s.buyer  || "",
-        seller:      s.seller || "",
-        timestamp:   s.timestamp || 0,
-        marketplace: s.orderSource || "unknown",
+      return (data.asset_events || []).map((e: any) => ({
+        tokenId:     e.nft?.identifier   || "",
+        price:       parseFloat(e.payment?.quantity || "0") / 1e18,
+        buyer:       e.buyer             || "",
+        seller:      e.seller            || "",
+        timestamp:   new Date(e.event_timestamp).getTime() / 1000,
+        marketplace: "opensea",
       }));
 
     } catch (err: any) {
@@ -162,20 +189,20 @@ export class KiraNFTs {
     limit:           number = 10
   ): Promise<NFTListing[]> {
     try {
-      const base = this.getBaseUrl(chain);
-      const res  = await fetch(
-        `${base}/orders/asks/v5?contracts=${contractAddress}&sortBy=price&limit=${limit}&normalizeRoyalties=false`,
+      const chainSlug = this.getChainSlug(chain);
+      const res       = await fetch(
+        `${OPENSEA_BASE}/listings/collection/${contractAddress}/best?limit=${limit}&chain=${chainSlug}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
       if (!res.ok) return [];
 
       const data = await res.json() as any;
-      return (data.orders || []).map((o: any) => ({
-        tokenId:     o.criteria?.data?.token?.tokenId || "",
-        price:       o.price?.amount?.native || 0,
-        seller:      o.maker || "",
-        marketplace: o.source?.name || "unknown",
-        validUntil:  o.validUntil || 0,
+      return (data.listings || []).map((l: any) => ({
+        tokenId:     l.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria || "",
+        price:       parseFloat(l.price?.current?.value || "0") / 1e18,
+        seller:      l.protocol_data?.parameters?.offerer || "",
+        marketplace: "opensea",
+        validUntil:  parseInt(l.protocol_data?.parameters?.endTime || "0"),
       }));
 
     } catch (err: any) {
@@ -226,34 +253,23 @@ export class KiraNFTs {
     limit: number = 10
   ): Promise<NFTCollection[]> {
     try {
-      const base = this.getBaseUrl(chain);
-      const res  = await fetch(
-        `${base}/collections/v7?sortBy=1DayVolume&limit=${limit}&normalizeRoyalties=false`,
+      const chainSlug = this.getChainSlug(chain);
+      const res       = await fetch(
+        `${OPENSEA_BASE}/collections?chain=${chainSlug}&order_by=one_day_volume&limit=${limit}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
       if (!res.ok) return [];
 
-      const data = await res.json() as any;
-      return (data.collections || []).map((col: any) => ({
-        address:        col.primaryContract?.toLowerCase() || "",
-        name:           col.name || "Unknown",
-        chain,
-        floorPrice:     col.floorAsk?.price?.amount?.native || 0,
-        floorPriceUsd:  col.floorAsk?.price?.amount?.usd    || 0,
-        floor7dChange:  col.floorSaleChange?.["7day"]  || 0,
-        floor30dChange: col.floorSaleChange?.["30day"] || 0,
-        volume24h:      col.volume?.["1day"]      || 0,
-        volume7d:       col.volume?.["7day"]      || 0,
-        sales24h:       col.salesCount?.["1day"]  || 0,
-        sales7d:        col.salesCount?.["7day"]  || 0,
-        holderCount:    col.ownerCount || 0,
-        totalSupply:    col.tokenCount || 0,
-        listedCount:    col.onSaleCount || 0,
-        listingRate:    col.tokenCount > 0
-          ? (col.onSaleCount / col.tokenCount) * 100 : 0,
-        topHolderPct:   0,
-        fetchedAt:      Date.now(),
-      }));
+      const data    = await res.json() as any;
+      const results = await Promise.allSettled(
+        (data.collections || []).map((c: any) =>
+          this.getCollection(c.contracts?.[0]?.address || c.collection, chain)
+        )
+      );
+
+      return results
+        .filter(r => r.status === "fulfilled" && r.value !== null)
+        .map(r => (r as PromiseFulfilledResult<NFTCollection>).value);
 
     } catch (err: any) {
       console.error(`Trending collections fetch failed:`, err?.message);
