@@ -103,7 +103,8 @@ export class KiraNFTs {
       if (!statsRes.ok || !metaRes.ok) return null;
 
       const stats = await statsRes.json() as any;
-      const meta  = await metaRes.json() as any;
+          const meta  = await metaRes.json() as any;
+          console.log(`OpenSea stats sample:`, JSON.stringify(stats).slice(0, 500));
 
       const floorEth  = stats.total?.floor_price      || 0;
       const supply    = stats.total?.num_owners        || 0;
