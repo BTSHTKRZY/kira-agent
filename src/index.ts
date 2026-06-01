@@ -15,6 +15,7 @@ import { KiraTechnicals }   from "./technicals.js";
 import { KiraResearch }     from "./research.js";
 import { KiraProposals }    from "./proposals.js";
 import { KiraFloorHistory } from "./floorhistory.js";
+import { KiraSmartMoney }   from "./smartmoney.js";
 import { checkForReplies, sendEmail, weeklyReportEmail } from "./email.js";
 import { kiraRedis }        from "./redis.js";
 
@@ -118,7 +119,8 @@ interface KiraState {
   watchlistCount:      number;
   paperTradeCount:     number;
   proposalSummary:     string;
-  floorHistorySummary: string;
+  floorHistorySummary:  string;
+  smartMoneySummary:    string;
 }
 
 const state: KiraState = {
@@ -148,7 +150,8 @@ const state: KiraState = {
   watchlistCount:      0,
   paperTradeCount:     0,
   proposalSummary:     "",
-  floorHistorySummary: "",
+  floorHistorySummary:  "",
+  smartMoneySummary:    "",
 };
 
 // ── MODULES ───────────────────────────────────────────────────────────────────
@@ -166,7 +169,8 @@ const portfolio    = new KiraPortfolio();
 const technicals   = new KiraTechnicals();
 const research     = new KiraResearch();
 const proposals    = new KiraProposals();
-const floorHistory = new KiraFloorHistory();
+const floorHistory  = new KiraFloorHistory();
+const smartMoney   = new KiraSmartMoney();
 
 // ── NORMIES ECOSYSTEM ─────────────────────────────────────────────────────────
 
@@ -234,12 +238,14 @@ async function scanMarketsForOpportunities(): Promise<void> {
   let macro;
   try { macro = await research.getMacroData(); } catch {}
 
-  const chains   = ["ethereum", "base"];
-  let watchAdded = 0;
-  let passed     = 0;
+  // Ethereum first — highest volume for both NFTs and tokens
+  const nftChains   = ["ethereum", "base"];
+  const tokenChains = ["ethereum", "base", "arbitrum"];
+  let watchAdded    = 0;
+  let passed        = 0;
 
-  // NFT scan
-  for (const chain of chains) {
+  // NFT scan — Ethereum primary (blue chips + volume), Base secondary (low floor opps)
+  for (const chain of nftChains) {
     const trending = await nfts.getTrendingCollections(chain, 10);
 
     // Record floor prices for history tracking
@@ -254,7 +260,9 @@ async function scanMarketsForOpportunities(): Promise<void> {
     await floorHistory.recordBatch(toRecord);
 
     for (const col of trending) {
-      if (col.floorPrice > 0.05) continue;
+      // Floor cap: 0.5 ETH for Ethereum (blue chips), 0.05 ETH for Base (low floor opps)
+      const floorCap = chain === "ethereum" ? 0.5 : 0.05;
+      if (col.floorPrice > floorCap) continue;
 
       // Enrich with our own floor history
       const enriched = await floorHistory.enrichFloorChanges(
@@ -266,7 +274,15 @@ async function scanMarketsForOpportunities(): Promise<void> {
 
       const holders       = await nfts.analyseHolders(col.address, col.chain);
       const listings      = await nfts.getFloorListings(col.address, col.chain, 10);
-      const trustedBuyers: string[] = [];
+
+      // Get smart money signal for this collection
+      const smSignal    = await smartMoney.getScoreContribution(col.address, col.chain);
+      const trustedBuyers = smSignal.score > 0
+        ? (await smartMoney.getSignalForAsset(col.address, col.chain))?.buyers || []
+        : [];
+
+      // Also ingest recent buyers into smart money tracker
+      await smartMoney.ingestFromNFTSales(holders.recentBuyers, col.name);
 
       const score = scoring.scoreNFT(col, holders, listings, trustedBuyers, macro);
       const dataTag = col.floorDataSource === "kira_own" ? " [own data]" : "";
@@ -283,15 +299,23 @@ async function scanMarketsForOpportunities(): Promise<void> {
     }
   }
 
-  // Token scan
+  // Token scan — Ethereum primary, Base secondary
   const trendingTokens = await discoverTrendingTokens();
   const seedTokens: Array<{ address: string; chain: string }> = [
+    // Ethereum mainnet — primary (highest volume, most smart money activity)
+    { address: "0x6982508145454ce325ddbe47a25d4ec3d2311933", chain: "ethereum" }, // PEPE
+    { address: "0x576e2bed8f7b46d34016198911cdf9886f78bea7", chain: "ethereum" }, // MOVE
+    { address: "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce", chain: "ethereum" }, // SHIB
+    { address: "0x514910771af9ca656af840dff83e8264ecf986ca", chain: "ethereum" }, // LINK
+    { address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", chain: "ethereum" }, // UNI
+    { address: "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9", chain: "ethereum" }, // AAVE
+    { address: "0xc00e94cb662c3520282e6f5717214004a7f26888", chain: "ethereum" }, // COMP
+    { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", chain: "ethereum" }, // WBTC
+    // Base — secondary (emerging ecosystem, lower cap opps)
     { address: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", chain: "base" },     // DEGEN
     { address: "0x532f27101965dd16442e59d40670faf5ebb142e4", chain: "base" },     // BRETT
     { address: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", chain: "base" },     // HIGHER
     { address: "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4", chain: "base" },     // TOSHI
-    { address: "0x6982508145454ce325ddbe47a25d4ec3d2311933", chain: "ethereum" }, // PEPE
-    { address: "0x576e2bed8f7b46d34016198911cdf9886f78bea7", chain: "ethereum" }, // MOVE
   ];
 
   const allTokens = [...seedTokens, ...trendingTokens];
@@ -307,6 +331,12 @@ async function scanMarketsForOpportunities(): Promise<void> {
     const price = await prices.getTokenPrice(token.address, token.chain);
     if (!price) continue;
 
+    // Get smart money signal for this token
+    const smSignal      = await smartMoney.getScoreContribution(token.address, token.chain);
+    const normiesWallets = smSignal.score > 0
+      ? (await smartMoney.getSignalForAsset(token.address, token.chain))?.buyers || []
+      : [];
+
     let tech;
     try {
       if (price.pairAddress) {
@@ -317,7 +347,7 @@ async function scanMarketsForOpportunities(): Promise<void> {
       }
     } catch {}
 
-    const score = scoring.scoreToken(price, [], 0.005, tech, macro);
+    const score = scoring.scoreToken(price, normiesWallets, 0.005, tech, macro);
 
     if (score.decision === "buy" || score.decision === "watchlist") {
       console.log(`Token: ${price.symbol} (${token.chain}) | Score: ${score.totalScore} | ${score.decision}`);
@@ -525,6 +555,18 @@ async function backgroundTasks(): Promise<void> {
     await scanMarketsForOpportunities();
   }
 
+  // Smart money scan every 4 hours
+  if (state.smartMoneySummary === "" || now - state.lastMarketScan > 4 * 60 * 60 * 1000) {
+    const signals = await smartMoney.scanForSignals();
+    state.smartMoneySummary = await smartMoney.formatSummaryForContext();
+    if (signals.length > 0) {
+      state.recentLearnings.push(
+        `Smart money: ${signals.length} signals. ` +
+        signals.slice(0, 3).map(s => `${s.assetName}: ${s.buyerCount} buyers`).join(", ")
+      );
+    }
+  }
+
   if (now - state.lastResearchCheck > 6 * 60 * 60 * 1000) {
     await runResearchCycle();
   }
@@ -619,6 +661,7 @@ OTHER RULES:
 - Last wallet check: ${state.lastWalletCheck > 0 ? Math.floor((Date.now() - state.lastWalletCheck) / 60000) + " min ago" : "never"}
 - Watchlist: ${state.watchlistCount} | Paper: ${state.paperTradeCount}
 - Floor history: ${state.floorHistorySummary}
+- Smart money: ${state.smartMoneySummary}
 - Proposals: ${state.proposalSummary}
 - Macro: ${state.macroSummary || "not yet fetched"}
 - DO NOT scan_tools/scan_markets if done < 120 min ago
@@ -813,6 +856,10 @@ async function kiraLoop(): Promise<void> {
   await research.seedBasePatterns();
   console.log("Research patterns seeded");
 
+  await smartMoney.seedWallets();
+  await smartMoney.ingestFromAgentCheck();
+  console.log("Smart money wallets seeded");
+
   state.xApiAvailable = await twitter.init();
   console.log(`X API: ${state.xApiAvailable ? "✓ available" : "⏳ not yet available"}`);
 
@@ -848,8 +895,10 @@ async function kiraLoop(): Promise<void> {
 
   state.proposalSummary     = await proposals.formatSummaryForContext();
   state.floorHistorySummary = await floorHistory.getSummaryForContext();
+  state.smartMoneySummary   = await smartMoney.formatSummaryForContext();
   console.log(`Proposals: ${state.proposalSummary}`);
   console.log(`Floor history: ${state.floorHistorySummary}`);
+  console.log(`Smart money: ${state.smartMoneySummary}`);
 
   console.log("Initial market scan...");
   await scanMarketsForOpportunities();
@@ -894,6 +943,7 @@ async function kiraLoop(): Promise<void> {
         `Last wallet check: ${state.lastWalletCheck > 0 ? Math.floor((now - state.lastWalletCheck) / 60000) + " min ago" : "never"}`,
         `Watchlist: ${state.watchlistCount} | Paper: ${state.paperTradeCount}`,
         `Floor history: ${state.floorHistorySummary}`,
+        `Smart money: ${state.smartMoneySummary}`,
         `Proposals: ${state.proposalSummary}`,
         `Macro: ${state.macroSummary || "not yet fetched"}`,
         `Normies: ${state.ecosystemSummary}`,
