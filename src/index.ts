@@ -110,6 +110,7 @@ interface KiraState {
   lastResearchCheck:   number;
   lastWeeklyReport:    number;
   lastPostTime:        number;
+  lastEngagementTime:  number;
   xApiAvailable:       boolean;
   hasPostedFirst:      boolean;
   baseBalance:         string;
@@ -141,6 +142,7 @@ const state: KiraState = {
   lastResearchCheck:   0,
   lastWeeklyReport:    0,
   lastPostTime:        0,
+  lastEngagementTime:  0,
   xApiAvailable:       false,
   hasPostedFirst:      false,
   baseBalance:         "0",
@@ -594,6 +596,11 @@ async function backgroundTasks(): Promise<void> {
     }
   }
 
+  // Auto follow mentioners every hour
+  if (state.xApiAvailable && now - state.lastMentionCheck > 60 * 60 * 1000) {
+    await twitter.followNewMentioners();
+  }
+
   if (state.recentLearnings.length > 200) {
     state.recentLearnings = state.recentLearnings.slice(-100);
   }
@@ -604,7 +611,8 @@ async function backgroundTasks(): Promise<void> {
 type Action =
   | "post" | "reply_mentions" | "check_wallet" | "endorse_wallet"
   | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade"
-  | "review_watchlist" | "learning_review" | "observe" | "sleep";
+  | "review_watchlist" | "learning_review" | "observe" | "sleep"
+  | "engage_community" | "follow_accounts" | "engage_topics";
 
 interface Decision {
   action:     Action;
@@ -635,6 +643,9 @@ ${state.recentLearnings.slice(-8).join("\n") || "none yet"}
 AVAILABLE ACTIONS:
 - post: tweet in Kira's voice
 - reply_mentions: check and reply to X mentions
+- engage_community: like and reply to priority accounts (normiesart, CodinCowboy etc)
+- follow_accounts: follow back mentioners and seed priority accounts
+- engage_topics: search and engage with relevant topic tweets
 - check_wallet: check a REAL known wallet via AgentCheck
 - endorse_wallet: endorse a trusted wallet on-chain
 - read_docs: read ERC-8257 or AgentCheck docs
@@ -649,11 +660,16 @@ AVAILABLE ACTIONS:
 POSTING RULES:
 - X API: ${state.xApiAvailable ? "YES — CAN POST" : "NO — cannot post"}
 - Minutes since last post: ${minutesSinceLastPost}
+- Minutes since last engagement: ${state.lastEngagementTime > 0 ? Math.floor((Date.now() - state.lastEngagementTime) / 60000) : 999}
 - Has posted first post: ${state.hasPostedFirst}
 - Max 3 posts per day (current: ${state.postCount})
 - Min 20 minutes between posts
 - ${!state.hasPostedFirst && state.xApiAvailable ? "PRIORITY: Write your first ever post as KIRA — introduce yourself mysteriously" : ""}
-- ${state.xApiAvailable && minutesSinceLastPost < 20 ? "TOO SOON TO POST — wait " + (20 - minutesSinceLastPost) + " more minutes" : ""}
+- ${state.xApiAvailable && minutesSinceLastPost < 15 ? "TOO SOON TO POST — wait " + (20 - minutesSinceLastPost) + " more minutes" : ""}
+- engage_community: engage with @normiesart, @CodinCowboy etc (max once per 2 hours)
+- follow_accounts: follow back mentioners (do once per session)
+- engage_topics: search and engage with relevant tweets (max once per 3 hours)
+- DO NOT engage_community/engage_topics if done < 120 min ago
 
 OTHER RULES:
 - Tool scan: ${state.lastToolScan > 0 ? Math.floor((Date.now() - state.lastToolScan) / 60000) + " min ago" : "never"}
@@ -690,9 +706,9 @@ Respond ONLY with valid JSON (no markdown):
       return { action: "sleep", content: "15", reasoning: "X API not available" };
 
     if (parsed.action === "post") {
-      if (minutesSinceLastPost < 20)
+      if (minutesSinceLastPost < 15)
         return { action: "observe", content: "Too soon to post — resting", reasoning: "Post cooldown" };
-      if (state.postCount >= 3)
+      if (state.postCount >= 5)
         return { action: "sleep", content: "30", reasoning: "Daily post limit reached" };
     }
 
@@ -740,7 +756,7 @@ async function execute(decision: Decision): Promise<void> {
           console.log(`✓ Posted (${state.postCount} today): ${decision.content.slice(0, 60)}`);
         }
       }
-      await sleep(20 * 60 * 1000);
+      await sleep(15 * 60 * 1000);
       break;
 
     case "reply_mentions":
@@ -748,6 +764,29 @@ async function execute(decision: Decision): Promise<void> {
       const replied = await twitter.processNewMentions(state.ecosystemSummary);
       console.log(`Replied to ${replied} mentions`);
       state.lastMentionCheck = Date.now();
+      await sleep(10 * 60 * 1000);
+      break;
+
+    case "engage_community":
+      if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
+      const engaged = await twitter.engageWithPriorityAccounts(state.ecosystemSummary);
+      state.lastEngagementTime = Date.now();
+      state.recentLearnings.push(`Community engagement: ${engaged} actions`);
+      await sleep(10 * 60 * 1000);
+      break;
+
+    case "follow_accounts":
+      if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
+      const followed = await twitter.followNewMentioners();
+      console.log(`Followed ${followed} new mentioners`);
+      await sleep(5 * 60 * 1000);
+      break;
+
+    case "engage_topics":
+      if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
+      const topicEngaged = await twitter.engageWithTopics(state.ecosystemSummary);
+      state.lastEngagementTime = Date.now();
+      state.recentLearnings.push(`Topic engagement: ${topicEngaged} actions`);
       await sleep(10 * 60 * 1000);
       break;
 
@@ -825,14 +864,9 @@ async function execute(decision: Decision): Promise<void> {
         state.recentLearnings.push(decision.content);
         console.log(`Observed: ${decision.content.slice(0, 100)}`);
       }
-      // If nothing else is available, sleep longer to avoid burning API calls
-      const recentObserves = state.recentLearnings
-        .slice(-4)
-        .filter(l => !l.startsWith("Normies:") && !l.startsWith("Registry:") && !l.startsWith("Docs:"))
-        .length;
-      await sleep(recentObserves >= 3 ? 15 * 60 * 1000 : 5 * 60 * 1000);
+      await sleep(5 * 60 * 1000);
       break;
-      
+
     case "sleep":
     default:
       const minutes = Math.max(1, Math.min(60, parseFloat(decision.content) || 15));
@@ -869,7 +903,9 @@ async function kiraLoop(): Promise<void> {
   console.log(`X API: ${state.xApiAvailable ? "✓ available" : "⏳ not yet available"}`);
 
   if (state.xApiAvailable) {
-    console.log("🎉 X API unlocked — KIRA will post her first message shortly");
+    console.log("🎉 X API unlocked — KIRA will post his first message shortly");
+    // Seed priority follows on first startup
+    await twitter.seedPriorityFollows();
   }
 
   console.log("Fetching initial ecosystem data...");
@@ -938,7 +974,7 @@ async function kiraLoop(): Promise<void> {
       const context = [
         `Cycle: ${state.cycleCount}`,
         `Session: ${Math.floor((now - state.sessionStart) / 60000)} min`,
-        `Posts today: ${state.postCount}/3 | X API: ${state.xApiAvailable}`,
+        `Posts today: ${state.postCount}/5 | X API: ${state.xApiAvailable}`,
         `Has posted first: ${state.hasPostedFirst}`,
         `Minutes since last post: ${state.lastPostTime > 0 ? Math.floor((now - state.lastPostTime) / 60000) : "never"}`,
         `Balance: ${state.baseBalance} ETH`,
