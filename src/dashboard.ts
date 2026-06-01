@@ -193,7 +193,7 @@ export function startDashboard(port: number = 3000): void {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(htmlDashboard(dashState));
       }
-    } else if (req.url === "/api") {
+    } else if (req.url === "/api/state") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(dashState, null, 2));
     } else {
