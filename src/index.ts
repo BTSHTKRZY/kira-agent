@@ -720,6 +720,11 @@ Respond ONLY with valid JSON (no markdown):
         Date.now() - state.lastMarketScan < 2 * 60 * 60 * 1000)
       return { action: "review_watchlist", content: "Reviewing watchlist", reasoning: "Market scan too recent" };
 
+    if ((parsed.action === "engage_community" || parsed.action === "engage_topics") &&
+        state.lastEngagementTime > 0 &&
+        Date.now() - state.lastEngagementTime < 60 * 60 * 1000)
+      return { action: "sleep", content: "20", reasoning: "Engagement cooldown" };
+    
     if (parsed.action === "learning_review" && state.lastLearningReview > 0 &&
         Date.now() - state.lastLearningReview < 30 * 24 * 60 * 60 * 1000)
       return { action: "observe", content: "Learning review not due yet", reasoning: "Too soon" };
@@ -961,7 +966,7 @@ async function kiraLoop(): Promise<void> {
       }
 
       console.log(
-        `\n── Cycle ${state.cycleCount} | Posts: ${state.postCount}/3 | ` +
+        `\n── Cycle ${state.cycleCount} | Posts: ${state.postCount}/5 | ` +
         `X: ${state.xApiAvailable ? "✓" : "⏳"} | ` +
         `Balance: ${state.baseBalance} ETH | ` +
         `Watchlist: ${state.watchlistCount} | ` +
