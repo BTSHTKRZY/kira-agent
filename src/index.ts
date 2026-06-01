@@ -825,9 +825,14 @@ async function execute(decision: Decision): Promise<void> {
         state.recentLearnings.push(decision.content);
         console.log(`Observed: ${decision.content.slice(0, 100)}`);
       }
-      await sleep(5 * 60 * 1000);
+      // If nothing else is available, sleep longer to avoid burning API calls
+      const recentObserves = state.recentLearnings
+        .slice(-4)
+        .filter(l => !l.startsWith("Normies:") && !l.startsWith("Registry:") && !l.startsWith("Docs:"))
+        .length;
+      await sleep(recentObserves >= 3 ? 15 * 60 * 1000 : 5 * 60 * 1000);
       break;
-
+      
     case "sleep":
     default:
       const minutes = Math.max(1, Math.min(60, parseFloat(decision.content) || 15));
