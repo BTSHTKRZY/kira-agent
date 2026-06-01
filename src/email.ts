@@ -2,7 +2,7 @@
 // KIRA sends proposals to herself, reads replies from the holder
 
 import * as nodemailer from "nodemailer";
-import * as Imap       from "imap";
+import Imap            from "imap";
 import { simpleParser } from "mailparser";
 
 const GMAIL_USER     = process.env.KIRA_EMAIL        || "kira.normies@gmail.com";
