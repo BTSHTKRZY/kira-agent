@@ -43,7 +43,7 @@ export async function sendEmail(
     console.log(`[Email] Sent: ${subject} (${info.messageId})`);
     return { success: true, messageId: info.messageId };
   } catch (err: any) {
-    console.error(`[Email] Send failed:`, err?.message);
+    console.error(`[Email] Send failed:`, err?.message || JSON.stringify(err));
     return { success: false, error: err?.message };
   }
 }
