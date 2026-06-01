@@ -208,7 +208,8 @@ export class KiraOnChainEvents {
   }
 
   async getRecentEvents(): Promise<OnChainEvent[]> {
-    return kiraRedis.getJson<OnChainEvent[]>(K.events()) || [];
+    const result = await kiraRedis.getJson<OnChainEvent[]>(K.events());
+    return result || [];
   }
 
   // ── HIGH SCORE ALERT ──────────────────────────────────────────────────────────
