@@ -1,5 +1,5 @@
 // nfts.ts — NFT data via OpenSea API
-// Covers ETH, Base, Arbitrum and other EVM chains
+// Enriched with KIRA's own floor history when available
 
 export interface NFTCollection {
   address:        string;
@@ -19,6 +19,7 @@ export interface NFTCollection {
   listingRate:    number;
   topHolderPct:   number;
   fetchedAt:      number;
+  floorDataSource?: string;  // "kira_own" | "partial" | "opensea"
 }
 
 export interface NFTSale {
@@ -48,7 +49,6 @@ export interface HolderAnalysis {
   washTradeRisk:  "low" | "medium" | "high";
 }
 
-// OpenSea chain slugs
 const OPENSEA_CHAINS: Record<string, string> = {
   ethereum:  "ethereum",
   base:      "base",
@@ -77,9 +77,10 @@ export class KiraNFTs {
     return OPENSEA_CHAINS[chain] || "ethereum";
   }
 
-    async getCollection(
+  async getCollection(
     contractAddress: string,
-    chain:           string = "ethereum"
+    chain:           string = "ethereum",
+    floorHistory?:   any    // KiraFloorHistory instance — optional enrichment
   ): Promise<NFTCollection | null> {
     const cacheKey = `${chain}:${contractAddress.toLowerCase()}`;
     const cached   = collectionCache.get(cacheKey);
@@ -88,7 +89,7 @@ export class KiraNFTs {
     try {
       const chainSlug = this.getChainSlug(chain);
 
-      // Step 1: resolve contract address to collection slug
+      // Step 1: resolve contract to slug
       const contractRes = await fetch(
         `${OPENSEA_BASE}/chain/${chainSlug}/contract/${contractAddress}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
@@ -98,7 +99,7 @@ export class KiraNFTs {
       const slug = contractData.collection;
       if (!slug) return null;
 
-      // Step 2: fetch collection metadata
+      // Step 2: metadata
       const metaRes = await fetch(
         `${OPENSEA_BASE}/collections/${slug}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
@@ -106,7 +107,7 @@ export class KiraNFTs {
       if (!metaRes.ok) return null;
       const meta = await metaRes.json() as any;
 
-      // Step 3: fetch stats using slug
+      // Step 3: stats
       const statsRes = await fetch(
         `${OPENSEA_BASE}/collections/${slug}/stats`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
@@ -115,51 +116,56 @@ export class KiraNFTs {
       const stats = await statsRes.json() as any;
 
       const floorEth  = stats.total?.floor_price  || 0;
-      const volume24h = stats.intervals?.find(
-        (i: any) => i.interval === "one_day"
-      )?.volume || 0;
-      const volume7d  = stats.intervals?.find(
-        (i: any) => i.interval === "seven_day"
-      )?.volume || 0;
-      const sales24h  = stats.intervals?.find(
-        (i: any) => i.interval === "one_day"
-      )?.sales || 0;
-      const sales7d   = stats.intervals?.find(
-        (i: any) => i.interval === "seven_day"
-      )?.sales || 0;
+      const volume24h = stats.intervals?.find((i: any) => i.interval === "one_day")?.volume    || 0;
+      const volume7d  = stats.intervals?.find((i: any) => i.interval === "seven_day")?.volume  || 0;
+      const sales24h  = stats.intervals?.find((i: any) => i.interval === "one_day")?.sales     || 0;
+      const sales7d   = stats.intervals?.find((i: any) => i.interval === "seven_day")?.sales   || 0;
 
-      // Floor change from interval floor prices vs current
-      const intervals    = stats.intervals || [];
-      const day7         = intervals.find((i: any) => i.interval === "seven_day");
-      const day30        = intervals.find((i: any) => i.interval === "thirty_day");
-      const floor7dAgo   = day7?.floor_price  || floorEth;
-      const floor30dAgo  = day30?.floor_price || floorEth;
-      const floor7dChange  = floor7dAgo > 0 && floor7dAgo !== floorEth
+      // OpenSea interval floor prices
+      const intervals   = stats.intervals || [];
+      const day7        = intervals.find((i: any) => i.interval === "seven_day");
+      const day30       = intervals.find((i: any) => i.interval === "thirty_day");
+      const floor7dAgo  = day7?.floor_price  || floorEth;
+      const floor30dAgo = day30?.floor_price || floorEth;
+
+      let floor7dChange  = floor7dAgo > 0 && floor7dAgo !== floorEth
         ? ((floorEth - floor7dAgo) / floor7dAgo) * 100 : 0;
-      const floor30dChange = floor30dAgo > 0 && floor30dAgo !== floorEth
+      let floor30dChange = floor30dAgo > 0 && floor30dAgo !== floorEth
         ? ((floorEth - floor30dAgo) / floor30dAgo) * 100 : 0;
+      let floorDataSource = "opensea";
 
-      const supply  = meta.total_supply  || 0;
-      const listed  = stats.total?.listed_count || 0;
+      // Enrich with KIRA's own floor history if available
+      if (floorHistory && floorEth > 0) {
+        const enriched = await floorHistory.enrichFloorChanges(
+          contractAddress, chain, floor7dChange, floor30dChange
+        );
+        floor7dChange   = enriched.floor7dChange;
+        floor30dChange  = enriched.floor30dChange;
+        floorDataSource = enriched.dataSource;
+      }
+
+      const supply = meta.total_supply || 0;
+      const listed = stats.total?.listed_count || 0;
 
       const collection: NFTCollection = {
-        address:        contractAddress.toLowerCase(),
-        name:           meta.name || slug,
+        address:         contractAddress.toLowerCase(),
+        name:            meta.name || slug,
         chain,
-        floorPrice:     floorEth,
-        floorPriceUsd:  floorEth * 2000,
+        floorPrice:      floorEth,
+        floorPriceUsd:   floorEth * 2000,
         floor7dChange,
         floor30dChange,
         volume24h,
         volume7d,
         sales24h,
         sales7d,
-        holderCount:    stats.total?.num_owners  || 0,
-        totalSupply:    supply,
-        listedCount:    listed,
-        listingRate:    supply > 0 ? (listed / supply) * 100 : 0,
-        topHolderPct:   0,
-        fetchedAt:      Date.now(),
+        holderCount:     stats.total?.num_owners  || 0,
+        totalSupply:     supply,
+        listedCount:     listed,
+        listingRate:     supply > 0 ? (listed / supply) * 100 : 0,
+        topHolderPct:    0,
+        fetchedAt:       Date.now(),
+        floorDataSource,
       };
 
       collectionCache.set(cacheKey, collection);
@@ -178,7 +184,7 @@ export class KiraNFTs {
   ): Promise<NFTSale[]> {
     try {
       const chainSlug = this.getChainSlug(chain);
-      const res       = await fetch(
+      const res = await fetch(
         `${OPENSEA_BASE}/events/collection/${contractAddress}?event_type=sale&limit=${limit}&chain=${chainSlug}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
@@ -207,7 +213,7 @@ export class KiraNFTs {
   ): Promise<NFTListing[]> {
     try {
       const chainSlug = this.getChainSlug(chain);
-      const res       = await fetch(
+      const res = await fetch(
         `${OPENSEA_BASE}/listings/collection/${contractAddress}/best?limit=${limit}&chain=${chainSlug}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
@@ -271,14 +277,14 @@ export class KiraNFTs {
   ): Promise<NFTCollection[]> {
     try {
       const chainSlug = this.getChainSlug(chain);
-      const res       = await fetch(
+      const res = await fetch(
         `${OPENSEA_BASE}/collections?chain=${chainSlug}&order_by=one_day_volume&limit=${limit}`,
         { headers: this.headers(), signal: AbortSignal.timeout(15000) }
       );
       if (!res.ok) return [];
 
       const data    = await res.json() as any;
-            const results = await Promise.allSettled(
+      const results = await Promise.allSettled(
         (data.collections || []).map((c: any) => {
           const address = c.contracts?.[0]?.address;
           if (!address) return Promise.resolve(null);
@@ -304,7 +310,7 @@ export class KiraNFTs {
     return [
       `${col.name} (${col.chain}):`,
       `Floor: ${col.floorPrice.toFixed(4)} ETH`,
-      `7d: ${col.floor7dChange > 0 ? "+" : ""}${col.floor7dChange.toFixed(1)}%`,
+      `7d: ${col.floor7dChange > 0 ? "+" : ""}${col.floor7dChange.toFixed(1)}%${col.floorDataSource === "kira_own" ? " ✓" : ""}`,
       `30d: ${col.floor30dChange > 0 ? "+" : ""}${col.floor30dChange.toFixed(1)}%`,
       `Vol 24h: ${col.volume24h.toFixed(3)} ETH`,
       `Sales 7d: ${col.sales7d}`,
