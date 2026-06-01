@@ -236,7 +236,6 @@ export class KiraTwitter {
       const tweets = await this.client.v2.userTimeline(user.data.id, {
         max_results:    count,
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
-        exclude:        ["retweets", "replies"],
       });
       return tweets.data?.data || [];
     } catch (err: any) {
@@ -244,7 +243,7 @@ export class KiraTwitter {
       return [];
     }
   }
-
+  
   // ── AI REPLY GENERATION ───────────────────────────────────────────────────────
 
   async generateReply(
