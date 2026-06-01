@@ -179,10 +179,11 @@ function htmlDashboard(s: DashboardState): string {
 
 export function startDashboard(port: number = 3000): void {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
-    if (req.url === "/health" || req.url === "/") {
-      const isJson = req.headers.accept?.includes("application/json");
+    const url = req.url || "/";
+    if (url === "/health" || url === "/" || url === "/api/state") {
+      const isJson = req.headers.accept?.includes("application/json") || url === "/api/state";
 
-      if (isJson || req.url === "/api") {
+      if (isJson) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           ...dashState,
@@ -193,10 +194,7 @@ export function startDashboard(port: number = 3000): void {
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(htmlDashboard(dashState));
       }
-    } else if (req.url === "/api/state") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(dashState, null, 2));
-    } else {
+        } else {
       res.writeHead(404);
       res.end("Not found");
     }
