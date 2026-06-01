@@ -11,6 +11,10 @@ import { KiraPrices }     from "./prices.js";
 import { KiraNFTs }       from "./nfts.js";
 import { KiraScoring }    from "./scoring.js";
 import { KiraPortfolio }  from "./portfolio.js";
+import { KiraTechnicals } from "./technicals.js";
+import { KiraResearch }   from "./research.js";
+import { KiraProposals }  from "./proposals.js";
+import { checkForReplies, sendEmail, weeklyReportEmail } from "./email.js";
 import { kiraRedis }      from "./redis.js";
 
 // ── KIRA IDENTITY ─────────────────────────────────────────────────────────────
@@ -46,13 +50,14 @@ CAPABILITIES:
 - Monitor Normies ecosystem via Tool #7
 - Check wallet trust via AgentCheck Tool #13
 - Read ERC-8257 registry for tool discovery
-- Endorse trusted wallets and report outcomes
-- Read documentation and learn from it
-- Post observations on X and reply to mentions
-- Scan NFT + token markets for opportunities
+- Endorse trusted wallets on-chain
+- Read documentation and learn
+- Post on X and reply to mentions
+- Scan NFT + token markets with technical + macro analysis
 - Build watchlist and paper trade with full thesis recording
-- Self-adjust scoring signal weights from outcome data
-- Discover trending tokens via DexScreener autonomously
+- Propose new signals/macro hypotheses to holder for approval
+- Self-adjust scoring weights from outcome data
+- Discover trending tokens via DexScreener
 
 CONSTITUTIONAL PRINCIPLES (immutable):
 1. Agent-holder relationship is sacred
@@ -71,66 +76,80 @@ HARD LIMITS:
 - Never interact with wallets rated below ${process.env.MIN_AGENTCHECK_RATING || "50"}
 - Never approve unlimited token spending
 - Always check AgentCheck before on-chain interactions
-- Paper trade only until Phase 5e is explicitly enabled`;
+- Paper trade only until Phase 5e is explicitly enabled
+- Always propose macro/signal changes — never apply unilaterally`;
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
 
 interface KiraState {
-  recentPosts:        string[];
-  recentLearnings:    string[];
-  knownWallets:       Record<string, string>;
-  sessionStart:       number;
-  postCount:          number;
-  cycleCount:         number;
-  lastEcosystemCheck: number;
-  lastMentionCheck:   number;
-  lastToolScan:       number;
-  lastDocRead:        number;
-  lastMarketScan:     number;
-  lastLearningReview: number;
-  lastWalletCheck:    number;
-  xApiAvailable:      boolean;
-  baseBalance:        string;
-  toolSummary:        string;
-  ecosystemSummary:   string;
-  watchlistCount:     number;
-  paperTradeCount:    number;
+  recentPosts:         string[];
+  recentLearnings:     string[];
+  knownWallets:        Record<string, string>;
+  sessionStart:        number;
+  postCount:           number;
+  cycleCount:          number;
+  lastEcosystemCheck:  number;
+  lastMentionCheck:    number;
+  lastToolScan:        number;
+  lastDocRead:         number;
+  lastMarketScan:      number;
+  lastLearningReview:  number;
+  lastWalletCheck:     number;
+  lastEmailCheck:      number;
+  lastResearchCheck:   number;
+  lastWeeklyReport:    number;
+  xApiAvailable:       boolean;
+  baseBalance:         string;
+  toolSummary:         string;
+  ecosystemSummary:    string;
+  macroSummary:        string;
+  watchlistCount:      number;
+  paperTradeCount:     number;
+  proposalSummary:     string;
 }
 
 const state: KiraState = {
-  recentPosts:        [],
-  recentLearnings:    [],
-  knownWallets:       {},
-  sessionStart:       Date.now(),
-  postCount:          0,
-  cycleCount:         0,
-  lastEcosystemCheck: 0,
-  lastMentionCheck:   0,
-  lastToolScan:       0,
-  lastDocRead:        0,
-  lastMarketScan:     0,
-  lastLearningReview: 0,
-  lastWalletCheck:    0,
-  xApiAvailable:      false,
-  baseBalance:        "0",
-  toolSummary:        "",
-  ecosystemSummary:   "",
-  watchlistCount:     0,
-  paperTradeCount:    0,
+  recentPosts:         [],
+  recentLearnings:     [],
+  knownWallets:        {},
+  sessionStart:        Date.now(),
+  postCount:           0,
+  cycleCount:          0,
+  lastEcosystemCheck:  0,
+  lastMentionCheck:    0,
+  lastToolScan:        0,
+  lastDocRead:         0,
+  lastMarketScan:      0,
+  lastLearningReview:  0,
+  lastWalletCheck:     0,
+  lastEmailCheck:      0,
+  lastResearchCheck:   0,
+  lastWeeklyReport:    0,
+  xApiAvailable:       false,
+  baseBalance:         "0",
+  toolSummary:         "",
+  ecosystemSummary:    "",
+  macroSummary:        "",
+  watchlistCount:      0,
+  paperTradeCount:     0,
+  proposalSummary:     "",
 };
 
 // ── MODULES ───────────────────────────────────────────────────────────────────
 
-const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-const twitter    = new KiraTwitter();
-const onchain    = new KiraOnchain();
-const tools      = new KiraTools();
-const docs       = new KiraDocs();
-const agentcheck = new KiraAgentCheck();
-const prices     = new KiraPrices();
-const nfts       = new KiraNFTs();
-const scoring    = new KiraScoring();
-const portfolio  = new KiraPortfolio();
+const anthropic    = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
+const twitter      = new KiraTwitter();
+const onchain      = new KiraOnchain();
+const tools        = new KiraTools();
+const docs         = new KiraDocs();
+const agentcheck   = new KiraAgentCheck();
+const prices       = new KiraPrices();
+const nfts         = new KiraNFTs();
+const scoring      = new KiraScoring();
+const portfolio    = new KiraPortfolio();
+const technicals   = new KiraTechnicals();
+const research     = new KiraResearch();
+const proposals    = new KiraProposals();
 
 // ── NORMIES ECOSYSTEM ─────────────────────────────────────────────────────────
 
@@ -171,29 +190,20 @@ async function discoverTrendingTokens(): Promise<Array<{ address: string; chain:
 
     const data   = await res.json() as any;
     const tokens = (Array.isArray(data) ? data : []).slice(0, 10);
-
     const chainMap: Record<string, string> = {
-      base:     "base",
-      ethereum: "ethereum",
-      arbitrum: "arbitrum",
+      base: "base", ethereum: "ethereum", arbitrum: "arbitrum",
     };
 
     const discovered = tokens
       .filter((t: any) => chainMap[t.chainId] && t.tokenAddress)
-      .map((t: any) => ({
-        address: t.tokenAddress as string,
-        chain:   chainMap[t.chainId],
-      }));
+      .map((t: any) => ({ address: t.tokenAddress as string, chain: chainMap[t.chainId] }));
 
     if (discovered.length > 0) {
       console.log(`Discovered ${discovered.length} trending tokens via DexScreener`);
-      state.recentLearnings.push(
-        `Token discovery: ${discovered.length} trending tokens found on Base/ETH/Arbitrum`
-      );
+      state.recentLearnings.push(`Token discovery: ${discovered.length} trending tokens found`);
     }
 
     return discovered;
-
   } catch (err: any) {
     console.error("Token discovery failed:", err?.message);
     return [];
@@ -205,63 +215,68 @@ async function discoverTrendingTokens(): Promise<Array<{ address: string; chain:
 async function scanMarketsForOpportunities(): Promise<void> {
   console.log("Scanning markets for opportunities...");
 
+  // Get macro data for context
+  let macro;
+  try { macro = await research.getMacroData(); } catch {}
+
   const chains   = ["ethereum", "base"];
   let watchAdded = 0;
   let passed     = 0;
 
-  // NFT scan — trending collections across chains
+  // NFT scan
   for (const chain of chains) {
     const trending = await nfts.getTrendingCollections(chain, 10);
-
     for (const col of trending) {
       if (col.floorPrice > 0.05) continue;
-
       const holders       = await nfts.analyseHolders(col.address, chain);
       const listings      = await nfts.getFloorListings(col.address, chain, 10);
       const trustedBuyers: string[] = [];
-
-      const score = scoring.scoreNFT(col, holders, listings, trustedBuyers);
+      const score = scoring.scoreNFT(col, holders, listings, trustedBuyers, macro);
       console.log(`NFT: ${col.name} | Score: ${score.totalScore} | ${score.decision}`);
-
       if (score.decision === "buy" || score.decision === "watchlist") {
         await portfolio.addToWatchlist(score, col.name);
         watchAdded++;
-      } else {
-        passed++;
-      }
-
+      } else { passed++; }
       await sleep(500);
     }
   }
 
-  // Token scan — seeded list + DexScreener trending discovery
+  // Token scan — seeded + discovered
   const trendingTokens = await discoverTrendingTokens();
   const seedTokens: Array<{ address: string; chain: string }> = [
-    // Base tokens
-    { address: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", chain: "base" }, // DEGEN
-    { address: "0x532f27101965dd16442e59d40670faf5ebb142e4", chain: "base" }, // BRETT
-    { address: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", chain: "base" }, // HIGHER
-    { address: "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4", chain: "base" }, // TOSHI
-    // Ethereum tokens
+    { address: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", chain: "base" },     // DEGEN
+    { address: "0x532f27101965dd16442e59d40670faf5ebb142e4", chain: "base" },     // BRETT
+    { address: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", chain: "base" },     // HIGHER
+    { address: "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4", chain: "base" },     // TOSHI
     { address: "0x6982508145454ce325ddbe47a25d4ec3d2311933", chain: "ethereum" }, // PEPE
     { address: "0x576e2bed8f7b46d34016198911cdf9886f78bea7", chain: "ethereum" }, // MOVE
   ];
 
-  // Merge and deduplicate
-  const allTokens  = [...seedTokens, ...trendingTokens];
-  const seen       = new Set<string>();
-  const dedupedTokens = allTokens.filter(t => {
+  const allTokens = [...seedTokens, ...trendingTokens];
+  const seen      = new Set<string>();
+  const deduped   = allTokens.filter(t => {
     const key = `${t.chain}:${t.address.toLowerCase()}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 
-  for (const token of dedupedTokens) {
+  for (const token of deduped) {
     const price = await prices.getTokenPrice(token.address, token.chain);
     if (!price) continue;
 
-    const score = scoring.scoreToken(price, [], 0.005);
+    // Get technicals from pair address if available
+    let tech;
+    try {
+      if (price.pairAddress) {
+        const candles = await technicals.getCandles(price.pairAddress, token.chain);
+        if (candles.length >= 26) {
+          tech = technicals.calculateIndicators(candles) || undefined;
+        }
+      }
+    } catch {}
+
+    const score = scoring.scoreToken(price, [], 0.005, tech, macro);
 
     if (score.decision === "buy" || score.decision === "watchlist") {
       console.log(`Token: ${price.symbol} (${token.chain}) | Score: ${score.totalScore} | ${score.decision}`);
@@ -278,16 +293,115 @@ async function scanMarketsForOpportunities(): Promise<void> {
 
   const portfolioSummary = await portfolio.formatSummaryForContext();
   state.recentLearnings.push(
-    `Market scan: ${watchAdded} added to watchlist, ${passed} passed. ${portfolioSummary}`
+    `Market scan: ${watchAdded} watchlist, ${passed} passed. ${portfolioSummary}`
   );
   console.log(`Market scan complete — ${watchAdded} additions, ${passed} passed`);
+}
+
+// ── RESEARCH CYCLE ────────────────────────────────────────────────────────────
+
+async function runResearchCycle(): Promise<void> {
+  console.log("Running research cycle...");
+
+  try {
+    const macro    = await research.getMacroData();
+    state.macroSummary = research.formatMacroForContext(macro);
+    console.log(`Macro: ${state.macroSummary}`);
+
+    const insights = await research.getMarketInsights();
+    if (insights.length > 0) {
+      state.recentLearnings.push(`Macro insights: ${insights.join(" | ")}`);
+      console.log(`Insights: ${insights.join(" | ")}`);
+    }
+
+    // Check for macro hypotheses worth proposing
+    const hypotheses = await research.detectMacroHypotheses(macro);
+    for (const h of hypotheses) {
+      const alreadyPending = await proposals.hasPendingProposal(h.patternId);
+      if (!alreadyPending) {
+        await proposals.createMacroProposal(
+          h.title,
+          h.observation,
+          h.patternId,
+          h.weights,
+          h.confidence
+        );
+        console.log(`[Research] Macro proposal created: ${h.title}`);
+      }
+    }
+
+    // Apply active pattern adjustments to scoring
+    const { adjustments, reasoning } = await research.getActivePatternAdjustments();
+    if (Object.keys(adjustments).length > 0) {
+      scoring.applyExternalAdjustments(adjustments);
+      state.recentLearnings.push(`Pattern adjustments: ${reasoning.join("; ")}`);
+    }
+
+  } catch (err: any) {
+    console.error("Research cycle error:", err?.message);
+  }
+
+  state.lastResearchCheck = Date.now();
+}
+
+// ── EMAIL CYCLE ───────────────────────────────────────────────────────────────
+
+async function checkEmailReplies(): Promise<void> {
+  console.log("Checking email replies...");
+  try {
+    const replies = await checkForReplies();
+    if (replies.length > 0) {
+      console.log(`Found ${replies.length} email reply/replies`);
+      await proposals.processReplies(replies);
+      state.recentLearnings.push(`Email: processed ${replies.length} reply/replies`);
+    }
+
+    // Expire stale proposals
+    await proposals.expireStale();
+
+    // Update proposal summary
+    state.proposalSummary = await proposals.formatSummaryForContext();
+
+  } catch (err: any) {
+    console.error("Email check error:", err?.message);
+  }
+  state.lastEmailCheck = Date.now();
+}
+
+// ── WEEKLY REPORT ─────────────────────────────────────────────────────────────
+
+async function sendWeeklyReport(): Promise<void> {
+  try {
+    const wl      = await portfolio.getWatchlist();
+    const summary = await portfolio.getSummary();
+    const pending = await proposals.getPending();
+
+    const topItems = wl.slice(0, 5).map(
+      w => `${w.name}: ${w.lastScore}/100 (${w.type})`
+    );
+
+    const body = weeklyReportEmail(
+      state.cycleCount,
+      wl.length,
+      summary.paperPositions,
+      summary.winRate / 100,
+      topItems,
+      state.recentLearnings.slice(-5),
+      pending.length
+    );
+
+    await sendEmail("KIRA Weekly Report", body);
+    state.lastWeeklyReport = Date.now();
+    console.log("[Email] Weekly report sent");
+  } catch (err: any) {
+    console.error("Weekly report error:", err?.message);
+  }
 }
 
 // ── PAPER TRADING ─────────────────────────────────────────────────────────────
 
 async function executePaperTrade(): Promise<void> {
   const watchlist = await portfolio.getWatchlist();
-
   if (!watchlist.length) {
     console.log("Watchlist empty — nothing to paper trade");
     return;
@@ -326,9 +440,7 @@ async function executePaperTrade(): Promise<void> {
     scoredAt:    candidate.scoredAt,
   };
 
-  const pos = await portfolio.openPosition(
-    mockScore, candidate.name, "paper", candidate.tokenId
-  );
+  const pos = await portfolio.openPosition(mockScore, candidate.name, "paper", candidate.tokenId);
   await portfolio.setEntryPrice(pos.id, entryPrice);
 
   const watchKey = `${candidate.chain}:${candidate.address}:${candidate.tokenId || "token"}`;
@@ -336,8 +448,7 @@ async function executePaperTrade(): Promise<void> {
 
   state.paperTradeCount++;
   state.recentLearnings.push(
-    `Paper trade opened: ${candidate.name} @ ${entryPrice.toFixed(4)} ETH | ` +
-    `Score: ${candidate.lastScore} | ${candidate.thesis.slice(0, 100)}`
+    `Paper trade: ${candidate.name} @ ${entryPrice.toFixed(4)} ETH | Score: ${candidate.lastScore}`
   );
   console.log(`Paper trade: ${candidate.name} @ ${entryPrice.toFixed(4)} ETH`);
 
@@ -351,19 +462,14 @@ async function executePaperTrade(): Promise<void> {
 
 async function runLearningReview(): Promise<void> {
   console.log("Running learning review...");
-
   const review = await portfolio.runLearningReview();
-
   for (const rec of review.recommendations) {
     scoring.adjustWeights(rec.type, rec.signal, rec.adjust === "up", rec.magnitude);
   }
-
   await scoring.saveWeights();
-
   state.lastLearningReview = Date.now();
   state.recentLearnings.push(`Learning review: ${review.summary}`);
-  console.log(`Learning review complete: ${review.summary}`);
-
+  console.log(`Learning review: ${review.summary}`);
   if (state.xApiAvailable && review.recommendations.length > 0) {
     const reflection = `Reviewing my theses. ${review.summary.slice(0, 200)}`;
     if (reflection.length <= 280) await twitter.post(reflection);
@@ -415,16 +521,29 @@ async function backgroundTasks(): Promise<void> {
     await scanMarketsForOpportunities();
   }
 
+  // Research cycle every 6 hours
+  if (now - state.lastResearchCheck > 6 * 60 * 60 * 1000) {
+    await runResearchCycle();
+  }
+
+  // Email check every 30 min
+  if (now - state.lastEmailCheck > 30 * 60 * 1000) {
+    await checkEmailReplies();
+  }
+
+  // Weekly report
+  if (now - state.lastWeeklyReport > 7 * 24 * 60 * 60 * 1000) {
+    await sendWeeklyReport();
+  }
+
   // Monthly learning review
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
-  if (
-    state.cycleCount > 100 &&
-    (state.lastLearningReview === 0 || now - state.lastLearningReview > oneMonth)
-  ) {
+  if (state.cycleCount > 100 &&
+    (state.lastLearningReview === 0 || now - state.lastLearningReview > oneMonth)) {
     await runLearningReview();
   }
 
-  // Recheck X API every 10 cycles if not available
+  // Recheck X API every 10 cycles
   if (!state.xApiAvailable && state.cycleCount % 10 === 0 && state.cycleCount > 0) {
     console.log("Rechecking X API...");
     state.xApiAvailable = await twitter.init();
@@ -443,18 +562,9 @@ async function backgroundTasks(): Promise<void> {
 // ── DECISION ENGINE ───────────────────────────────────────────────────────────
 
 type Action =
-  | "post"
-  | "reply_mentions"
-  | "check_wallet"
-  | "endorse_wallet"
-  | "read_docs"
-  | "scan_tools"
-  | "scan_markets"
-  | "paper_trade"
-  | "review_watchlist"
-  | "learning_review"
-  | "observe"
-  | "sleep";
+  | "post" | "reply_mentions" | "check_wallet" | "endorse_wallet"
+  | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade"
+  | "review_watchlist" | "learning_review" | "observe" | "sleep";
 
 interface Decision {
   action:     Action;
@@ -479,42 +589,38 @@ RECENT LEARNINGS (already know this):
 ${state.recentLearnings.slice(-8).join("\n") || "none yet"}
 
 AVAILABLE ACTIONS:
-- post: tweet in Kira's voice (only if X API available, wait 20+ min between posts)
+- post: tweet in Kira's voice (only if X API available, 20+ min between posts)
 - reply_mentions: check and reply to X mentions (only if X API available)
-- check_wallet: check a REAL wallet 0x... from known Normies holders or recent buyers — do NOT invent addresses
-- endorse_wallet: endorse a trusted wallet you know
+- check_wallet: check a REAL known wallet via AgentCheck
+- endorse_wallet: endorse a trusted wallet on-chain
 - read_docs: read ERC-8257 or AgentCheck documentation
-- scan_tools: scan ERC-8257 registry (only if last scan was 2+ hours ago)
-- scan_markets: scan NFT + token markets for opportunities (every 2+ hours)
-- paper_trade: open a paper trade on top watchlist item above score 70
-- review_watchlist: check current watchlist scores and thesis
-- learning_review: grade past theses and adjust signal weights (monthly only)
-- observe: record an internal observation or learning
-- sleep: rest for N minutes (use content = number of minutes)
+- scan_tools: scan ERC-8257 registry (2+ hours gap)
+- scan_markets: scan NFT + token markets (2+ hours gap)
+- paper_trade: open paper trade on watchlist item above score 70
+- review_watchlist: check current watchlist
+- learning_review: grade theses and adjust weights (monthly)
+- observe: record internal observation
+- sleep: rest N minutes
 
 IMPORTANT RULES:
-- X API available: ${state.xApiAvailable ? "YES — can post" : "NO — do NOT choose post or reply_mentions"}
-- Tool scan last done: ${state.lastToolScan > 0 ? Math.floor((Date.now() - state.lastToolScan) / 60000) + " min ago" : "never"}
-- Market scan last done: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
-- Doc read last done: ${state.lastDocRead > 0 ? Math.floor((Date.now() - state.lastDocRead) / 60000) + " min ago" : "never"}
-- Ecosystem last checked: ${state.lastEcosystemCheck > 0 ? Math.floor((Date.now() - state.lastEcosystemCheck) / 60000) + " min ago" : "never"}
+- X API: ${state.xApiAvailable ? "YES" : "NO — do NOT choose post or reply_mentions"}
+- Tool scan: ${state.lastToolScan > 0 ? Math.floor((Date.now() - state.lastToolScan) / 60000) + " min ago" : "never"}
+- Market scan: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
 - Last wallet check: ${state.lastWalletCheck > 0 ? Math.floor((Date.now() - state.lastWalletCheck) / 60000) + " min ago" : "never"}
-- Watchlist items: ${state.watchlistCount}
-- Paper trades open: ${state.paperTradeCount}
-- DO NOT choose scan_tools if done less than 120 minutes ago
-- DO NOT choose scan_markets if done less than 120 minutes ago
-- DO NOT choose check_wallet if done less than 5 minutes ago
-- DO NOT choose check_wallet with invented or placeholder addresses — only use real known addresses
-- DO NOT choose learning_review unless 30+ days since last review
-- Known real wallets to check: ${Object.keys(state.knownWallets).slice(0, 3).join(", ") || "holder wallet: 0x6f33e7b6460daC803c53ab6e02da8C675633d516"}
-- Vary your actions — observe, scan markets, paper trade, check wallets, read docs, sleep
+- Watchlist: ${state.watchlistCount} items | Paper trades: ${state.paperTradeCount}
+- Proposals: ${state.proposalSummary}
+- Macro: ${state.macroSummary || "not yet fetched"}
+- DO NOT scan_tools/scan_markets if done < 120 min ago
+- DO NOT check_wallet if done < 5 min ago
+- DO NOT use invented wallet addresses — only real known ones
+- Known wallets: holder 0x6f33e7b6460daC803c53ab6e02da8C675633d516, KIRA 0x176086ACE60F74D211E68b7bABFfF5C35E6D2b7d
 - When nothing urgent: sleep 10-20 minutes
 
-Respond ONLY with valid JSON (no markdown backticks):
+Respond ONLY with valid JSON (no markdown):
 {
   "action": "chosen action",
-  "content": "post text or observation or sleep minutes",
-  "target": "wallet address if checking or endorsing",
+  "content": "text or minutes",
+  "target": "wallet if checking",
   "reasoning": "brief note"
 }`,
     messages: [{ role: "user", content: "What should Kira do right now?" }],
@@ -526,52 +632,30 @@ Respond ONLY with valid JSON (no markdown backticks):
     const parsed = JSON.parse(clean) as Decision;
 
     // Safety overrides
-    if (!state.xApiAvailable && (parsed.action === "post" || parsed.action === "reply_mentions")) {
+    if (!state.xApiAvailable && (parsed.action === "post" || parsed.action === "reply_mentions"))
       return { action: "sleep", content: "15", reasoning: "X API not available" };
-    }
-    if (
-      parsed.action === "scan_tools" &&
-      state.lastToolScan > 0 &&
-      Date.now() - state.lastToolScan < 2 * 60 * 60 * 1000
-    ) {
+
+    if (parsed.action === "scan_tools" && state.lastToolScan > 0 &&
+        Date.now() - state.lastToolScan < 2 * 60 * 60 * 1000)
       return { action: "observe", content: state.toolSummary || "Registry scanned recently", reasoning: "Too soon" };
-    }
-    if (
-      parsed.action === "scan_markets" &&
-      state.lastMarketScan > 0 &&
-      Date.now() - state.lastMarketScan < 2 * 60 * 60 * 1000
-    ) {
-      return { action: "review_watchlist", content: "Reviewing current watchlist", reasoning: "Market scan done recently" };
-    }
-    if (
-      parsed.action === "learning_review" &&
-      state.lastLearningReview > 0 &&
-      Date.now() - state.lastLearningReview < 30 * 24 * 60 * 60 * 1000
-    ) {
+
+    if (parsed.action === "scan_markets" && state.lastMarketScan > 0 &&
+        Date.now() - state.lastMarketScan < 2 * 60 * 60 * 1000)
+      return { action: "review_watchlist", content: "Reviewing watchlist", reasoning: "Market scan too recent" };
+
+    if (parsed.action === "learning_review" && state.lastLearningReview > 0 &&
+        Date.now() - state.lastLearningReview < 30 * 24 * 60 * 60 * 1000)
       return { action: "observe", content: "Learning review not due yet", reasoning: "Too soon" };
-    }
-    // Prevent invented wallet addresses
+
     if (parsed.action === "check_wallet") {
       const target = parsed.target || parsed.content;
-      const knownWallets = [
-        "0x6f33e7b6460daC803c53ab6e02da8C675633d516", // holder
-        "0x176086ACE60F74D211E68b7bABFfF5C35E6D2b7d", // kira
-        "0x38530729583d4482307CaB0cB64C2f53Bb5B0b97", // cert registry
-        ...Object.keys(state.knownWallets),
-      ];
-      const isReal = knownWallets.some(
-        w => w.toLowerCase() === target?.toLowerCase()
-      );
-      if (!isReal && target?.toLowerCase().includes("12345")) {
-        return { action: "sleep", content: "10", reasoning: "Blocked invented wallet address" };
-      }
-      if (state.lastWalletCheck > 0 && Date.now() - state.lastWalletCheck < 5 * 60 * 1000) {
-        return { action: "observe", content: "Wallet check too recent — resting", reasoning: "Cooldown" };
-      }
+      if (state.lastWalletCheck > 0 && Date.now() - state.lastWalletCheck < 5 * 60 * 1000)
+        return { action: "observe", content: "Wallet check cooldown", reasoning: "Too soon" };
+      if (target?.toLowerCase().includes("12345") || target?.toLowerCase().includes("1a2b"))
+        return { action: "sleep", content: "10", reasoning: "Blocked invented address" };
     }
 
     return parsed;
-
   } catch {
     return { action: "sleep", content: "15" };
   }
@@ -660,9 +744,9 @@ async function execute(decision: Decision): Promise<void> {
     case "review_watchlist":
       const wl = await portfolio.getWatchlist();
       const wlSummary = wl.length > 0
-        ? wl.slice(0, 5).map(w => `${w.name || w.address?.slice(0, 8) || "unknown"}: ${w.lastScore}/100`).join(", ")
+        ? wl.slice(0, 5).map(w => `${w.name || w.address?.slice(0, 8)}: ${w.lastScore}/100`).join(", ")
         : "empty";
-      state.recentLearnings.push(`Watchlist (${wl.length} items): ${wlSummary}`);
+      state.recentLearnings.push(`Watchlist (${wl.length}): ${wlSummary}`);
       console.log(`Watchlist review: ${wlSummary}`);
       await sleep(2 * 60 * 1000);
       break;
@@ -693,7 +777,7 @@ async function execute(decision: Decision): Promise<void> {
 
 async function kiraLoop(): Promise<void> {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("KIRA v3 awakening... Normie #2635 online");
+  console.log("KIRA v4 awakening... Normie #2635 online");
   console.log(`Wallet:  ${KIRA_WALLET}`);
   console.log(`Token:   ${KIRA_TOKEN}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -704,6 +788,10 @@ async function kiraLoop(): Promise<void> {
 
   await scoring.loadWeights();
   console.log("Signal weights loaded");
+
+  // Seed base research patterns
+  await research.seedBasePatterns();
+  console.log("Research patterns seeded");
 
   state.xApiAvailable = await twitter.init();
   console.log(`X API: ${state.xApiAvailable ? "✓ available" : "⏳ not yet available"}`);
@@ -725,9 +813,19 @@ async function kiraLoop(): Promise<void> {
   if (initialDocs) state.recentLearnings.push(`Docs: ${initialDocs.slice(0, 200)}`);
   state.lastDocRead = Date.now();
 
+  // Initial research cycle
+  console.log("Initial research cycle...");
+  await runResearchCycle();
+
+  // Initial email check
+  await checkEmailReplies();
+
   const portfolioSummary = await portfolio.formatSummaryForContext();
   state.recentLearnings.push(`Portfolio: ${portfolioSummary}`);
   console.log(`Portfolio: ${portfolioSummary}`);
+
+  state.proposalSummary = await proposals.formatSummaryForContext();
+  console.log(`Proposals: ${state.proposalSummary}`);
 
   console.log("Initial market scan...");
   await scanMarketsForOpportunities();
@@ -750,18 +848,18 @@ async function kiraLoop(): Promise<void> {
 
       const context = [
         `Cycle: ${state.cycleCount}`,
-        `Session running: ${Math.floor((now - state.sessionStart) / 60000)} minutes`,
-        `Posts made: ${state.postCount}`,
-        `X API available: ${state.xApiAvailable}`,
-        `Base ETH balance: ${state.baseBalance}`,
-        `Known wallets checked: ${Object.keys(state.knownWallets).length}`,
-        `Last tool scan: ${state.lastToolScan > 0 ? Math.floor((now - state.lastToolScan) / 60000) + " min ago" : "just done on startup"}`,
-        `Last doc read: ${state.lastDocRead > 0 ? Math.floor((now - state.lastDocRead) / 60000) + " min ago" : "just done on startup"}`,
-        `Last ecosystem check: ${state.lastEcosystemCheck > 0 ? Math.floor((now - state.lastEcosystemCheck) / 60000) + " min ago" : "never"}`,
-        `Last market scan: ${state.lastMarketScan > 0 ? Math.floor((now - state.lastMarketScan) / 60000) + " min ago" : "just done on startup"}`,
+        `Session: ${Math.floor((now - state.sessionStart) / 60000)} min`,
+        `Posts: ${state.postCount} | X API: ${state.xApiAvailable}`,
+        `Balance: ${state.baseBalance} ETH`,
+        `Wallets checked: ${Object.keys(state.knownWallets).length}`,
+        `Tool scan: ${state.lastToolScan > 0 ? Math.floor((now - state.lastToolScan) / 60000) + " min ago" : "startup"}`,
+        `Doc read: ${state.lastDocRead > 0 ? Math.floor((now - state.lastDocRead) / 60000) + " min ago" : "startup"}`,
+        `Ecosystem: ${state.lastEcosystemCheck > 0 ? Math.floor((now - state.lastEcosystemCheck) / 60000) + " min ago" : "never"}`,
+        `Market scan: ${state.lastMarketScan > 0 ? Math.floor((now - state.lastMarketScan) / 60000) + " min ago" : "startup"}`,
         `Last wallet check: ${state.lastWalletCheck > 0 ? Math.floor((now - state.lastWalletCheck) / 60000) + " min ago" : "never"}`,
-        `Watchlist items: ${state.watchlistCount}`,
-        `Paper trades open: ${state.paperTradeCount}`,
+        `Watchlist: ${state.watchlistCount} | Paper: ${state.paperTradeCount}`,
+        `Proposals: ${state.proposalSummary}`,
+        `Macro: ${state.macroSummary || "not yet fetched"}`,
         `Normies: ${state.ecosystemSummary}`,
         `Registry: ${state.toolSummary}`,
       ].join("\n");
