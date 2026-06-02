@@ -423,9 +423,9 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
       if (this.lastMentionId) params.since_id = this.lastMentionId;
       const mentions = await this.client.v2.userMentionTimeline(this.myUserId, params);
       const tweets   = mentions.data?.data || [];
-      if (tweets.length > 0) {
+      if (tweets.length > 0 && tweets[0].id) {
         this.lastMentionId = tweets[0].id;
-        await kiraRedis.set(REDIS_KEYS.lastMentionId, this.lastMentionId);
+        await kiraRedis.set(REDIS_KEYS.lastMentionId, tweets[0].id);
       }
       return tweets;
     } catch (err: any) { console.error("Get mentions failed:", err?.message); return []; }
@@ -469,7 +469,7 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
       });
       return (tweets.data?.data || []).filter(
-        t => !t.text.startsWith("RT ") && !t.text.startsWith("@")
+        (t: TweetV2) => !t.text.startsWith("RT ") && !t.text.startsWith("@")
       );
     } catch (err: any) { console.error(`Get tweets failed @${username}:`, err?.message); return []; }
   }
