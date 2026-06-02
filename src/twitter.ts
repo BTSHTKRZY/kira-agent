@@ -1,6 +1,5 @@
-// twitter.ts — Full X integration v4.4
-// Posts, replies, likes, follows, DMs, threads, quote-tweets, smart follow
-// 403 reply fallback: mention-style tweet (threads visually on X)
+// twitter.ts — Full X integration v4.5
+// Key fix: repliedTweets and likedTweets persisted in Redis across deployments
 
 import { TwitterApi, TweetV2 } from "twitter-api-v2";
 import Anthropic from "@anthropic-ai/sdk";
@@ -40,6 +39,17 @@ const SEARCH_TOPICS = [
 
 const DM_PROPOSAL_KEYWORDS = ["APPROVE", "REJECT", "MODIFY", "ACKNOWLEDGE"];
 
+// Redis keys for persistent state
+const REDIS_KEYS = {
+  repliedTweets: "kira:twitter:replied",
+  likedTweets:   "kira:twitter:liked",
+  followedUsers: "kira:twitter:followed",
+  lastMentionId: "kira:twitter:lastmention",
+};
+
+// Max items to persist — keep last N to avoid unbounded growth
+const MAX_PERSISTED = 2000;
+
 export class KiraTwitter {
   private client:        TwitterApi;
   private anthropic:     Anthropic;
@@ -50,7 +60,6 @@ export class KiraTwitter {
   private followedUsers: Set<string> = new Set();
   private lastMentionId: string | undefined;
   private lastDmId:      string | undefined;
-  // Cache of userId -> username to avoid repeat API calls
   private userCache:     Map<string, string> = new Map();
 
   constructor() {
@@ -63,6 +72,51 @@ export class KiraTwitter {
     this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
   }
 
+  // ── LOAD PERSISTED STATE ──────────────────────────────────────────────────────
+
+  private async loadPersistedState(): Promise<void> {
+    try {
+      // Load replied tweets
+      const replied = await kiraRedis.getJson<string[]>(REDIS_KEYS.repliedTweets);
+      if (replied) replied.forEach(id => this.repliedTweets.add(id));
+
+      // Load liked tweets
+      const liked = await kiraRedis.getJson<string[]>(REDIS_KEYS.likedTweets);
+      if (liked) liked.forEach(id => this.likedTweets.add(id));
+
+      // Load followed users
+      const followed = await kiraRedis.getJson<string[]>(REDIS_KEYS.followedUsers);
+      if (followed) followed.forEach(id => this.followedUsers.add(id));
+
+      // Load last mention ID
+      const lastMention = await kiraRedis.get(REDIS_KEYS.lastMentionId);
+      if (lastMention) this.lastMentionId = lastMention;
+
+      console.log(`[Twitter] Restored: ${this.repliedTweets.size} replied, ${this.likedTweets.size} liked, ${this.followedUsers.size} followed`);
+    } catch (err: any) {
+      console.error("[Twitter] State load failed:", err?.message);
+    }
+  }
+
+  // ── PERSIST STATE ─────────────────────────────────────────────────────────────
+
+  private async persistReplied(): Promise<void> {
+    const arr = [...this.repliedTweets].slice(-MAX_PERSISTED);
+    await kiraRedis.setJson(REDIS_KEYS.repliedTweets, arr);
+  }
+
+  private async persistLiked(): Promise<void> {
+    const arr = [...this.likedTweets].slice(-MAX_PERSISTED);
+    await kiraRedis.setJson(REDIS_KEYS.likedTweets, arr);
+  }
+
+  private async persistFollowed(): Promise<void> {
+    const arr = [...this.followedUsers].slice(-MAX_PERSISTED);
+    await kiraRedis.setJson(REDIS_KEYS.followedUsers, arr);
+  }
+
+  // ── INIT ──────────────────────────────────────────────────────────────────────
+
   async init(): Promise<boolean> {
     try {
       const me        = await this.client.v2.me();
@@ -70,10 +124,20 @@ export class KiraTwitter {
       this.myUsername = me.data.username;
       this.userCache.set(me.data.id, me.data.username);
       console.log(`X authenticated as: ${me.data.username} (${this.myUserId})`);
+
+      // Load persisted interaction history
+      await this.loadPersistedState();
+
+      // Also load current following list from X API
       try {
         const following = await this.client.v2.following(this.myUserId, { max_results: 100 });
-        (following.data || []).forEach((u: any) => this.followedUsers.add(u.id));
+        (following.data || []).forEach((u: any) => {
+          this.followedUsers.add(u.id);
+          if (u.username) this.userCache.set(u.id, u.username);
+        });
+        await this.persistFollowed();
       } catch {}
+
       return true;
     } catch (err: any) {
       console.error("X auth failed:", err?.data?.status || err?.message);
@@ -81,7 +145,7 @@ export class KiraTwitter {
     }
   }
 
-  // ── GET USERNAME FROM ID ──────────────────────────────────────────────────────
+  // ── GET USERNAME ──────────────────────────────────────────────────────────────
 
   private async getUsernameById(userId: string): Promise<string | null> {
     if (this.userCache.has(userId)) return this.userCache.get(userId)!;
@@ -107,7 +171,7 @@ export class KiraTwitter {
     }
   }
 
-  // ── THREAD POSTING ────────────────────────────────────────────────────────────
+  // ── THREAD ────────────────────────────────────────────────────────────────────
 
   async postThread(tweets: string[]): Promise<boolean> {
     if (!tweets.length) return false;
@@ -120,7 +184,7 @@ export class KiraTwitter {
           ? await this.client.v2.reply(content, lastTweetId)
           : await this.client.v2.tweet(content);
         lastTweetId = result.data.id;
-        console.log(`✓ Thread ${i + 1}/${tweets.length}: ${content.slice(0, 60)}...`);
+        console.log(`✓ Thread ${i + 1}/${tweets.length}`);
         await new Promise(r => setTimeout(r, 1000));
       }
       return true;
@@ -135,12 +199,10 @@ export class KiraTwitter {
   async quoteTweet(tweetId: string, comment: string): Promise<boolean> {
     try {
       if (comment.length > 250) comment = comment.slice(0, 247) + "...";
-      await this.client.v2.tweet({
-        text:           comment,
-        quote_tweet_id: tweetId,
-      });
+      await this.client.v2.tweet({ text: comment, quote_tweet_id: tweetId });
       this.repliedTweets.add(tweetId);
-      console.log(`✓ Quote tweeted ${tweetId}: ${comment.slice(0, 60)}...`);
+      await this.persistReplied();
+      console.log(`✓ Quote tweeted ${tweetId}`);
       return true;
     } catch (err: any) {
       console.error("Quote tweet failed:", err?.data || err?.message);
@@ -148,57 +210,40 @@ export class KiraTwitter {
     }
   }
 
-  // ── REPLY — with 403 fallback to mention-style tweet ─────────────────────────
-  // When KIRA isn't part of a conversation, X blocks replies (403).
-  // Fallback: post a mention tweet (@author content) — X threads these visually.
-  // This is the same approach AxiomBot uses.
+  // ── REPLY — 403 fallback to mention-style tweet ───────────────────────────────
 
-  async reply(
-    tweetId:    string,
-    content:    string,
-    authorId?:  string   // pass author ID to enable mention fallback
-  ): Promise<boolean> {
+  async reply(tweetId: string, content: string, authorId?: string): Promise<boolean> {
     try {
       if (content.length > 280) content = content.slice(0, 277) + "...";
       await this.client.v2.reply(content, tweetId);
       this.repliedTweets.add(tweetId);
+      await this.persistReplied();
       console.log(`✓ Replied to ${tweetId}: ${content.slice(0, 60)}...`);
       return true;
     } catch (err: any) {
-      const status = err?.data?.status || err?.data?.detail;
-      const is403  = err?.data?.status === 403 ||
-                     String(err?.data?.detail || "").includes("not allowed") ||
-                     String(err?.message || "").includes("403");
-
+      const is403 = err?.data?.status === 403 ||
+                    String(err?.data?.detail || "").includes("not allowed") ||
+                    String(err?.message || "").includes("403");
       if (is403 && authorId) {
-        // Fallback: mention-style tweet — threads visually on X
         console.log(`Reply blocked (403) — posting as mention-style tweet`);
         return this.replyAsMention(tweetId, content, authorId);
       }
-
       console.error("Reply failed:", err?.data || err?.message);
       return false;
     }
   }
 
-  // Post a mention tweet that threads visually on X without needing official reply permission
-  private async replyAsMention(
-    tweetId:  string,
-    content:  string,
-    authorId: string
-  ): Promise<boolean> {
+  private async replyAsMention(tweetId: string, content: string, authorId: string): Promise<boolean> {
     try {
-      const username   = await this.getUsernameById(authorId);
-      const mention    = username ? `@${username} ` : "";
-      const fullText   = (mention + content).slice(0, 280);
-
+      const username = await this.getUsernameById(authorId);
+      const mention  = username ? `@${username} ` : "";
+      const fullText = (mention + content).slice(0, 280);
       await this.client.v2.tweet(fullText);
       this.repliedTweets.add(tweetId);
-      console.log(`✓ Mention-reply to @${username || authorId}: ${content.slice(0, 50)}...`);
+      await this.persistReplied();
+      console.log(`✓ Mention-reply to @${username || authorId}`);
       return true;
-    } catch (err: any) {
-      // Final fallback: quote tweet
-      console.log(`Mention failed — falling back to quote tweet`);
+    } catch {
       return this.quoteTweet(tweetId, content);
     }
   }
@@ -210,6 +255,7 @@ export class KiraTwitter {
     try {
       await this.client.v2.like(this.myUserId, tweetId);
       this.likedTweets.add(tweetId);
+      await this.persistLiked();
       console.log(`✓ Liked: ${tweetId}`);
       return true;
     } catch (err: any) {
@@ -225,13 +271,11 @@ export class KiraTwitter {
       const user = await this.client.v2.userByUsername(username);
       if (!user.data) return false;
       const userId = user.data.id;
-      if (this.followedUsers.has(userId)) {
-        console.log(`Already following @${username}`);
-        return false;
-      }
+      if (this.followedUsers.has(userId)) { console.log(`Already following @${username}`); return false; }
       await this.client.v2.follow(this.myUserId, userId);
       this.followedUsers.add(userId);
       this.userCache.set(userId, username);
+      await this.persistFollowed();
       console.log(`✓ Followed: @${username}`);
       return true;
     } catch (err: any) {
@@ -245,7 +289,7 @@ export class KiraTwitter {
     try {
       await this.client.v2.follow(this.myUserId, userId);
       this.followedUsers.add(userId);
-      console.log(`✓ Followed user: ${userId}`);
+      await this.persistFollowed();
       return true;
     } catch (err: any) {
       console.error(`Follow failed ${userId}:`, err?.data || err?.message);
@@ -263,79 +307,55 @@ export class KiraTwitter {
     return followed;
   }
 
-  // ── SMART FOLLOW ENGINE ───────────────────────────────────────────────────────
-  // KIRA decides who to follow based on current intelligence context
-  // Runs every 12 hours — quality over quantity
+  // ── SMART FOLLOW ──────────────────────────────────────────────────────────────
 
   async smartFollow(context: string): Promise<number> {
     let followed = 0;
     try {
       const response = await this.anthropic.messages.create({
-        model:      "claude-sonnet-4-5",
-        max_tokens: 200,
-        system:     `You are helping KIRA decide who to follow on X to improve his intelligence.
-Suggest 2-3 X usernames worth following based on the context.
-Focus on: NFT market analysts, on-chain AI agents, crypto smart money trackers,
-Ethereum/Base ecosystem builders, NFT collectors with good signal.
-Only suggest accounts KIRA would genuinely learn from — not just popular accounts.
-Respond ONLY with a JSON array of usernames (no @ symbol, no explanation).
-Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
-        messages: [{
-          role:    "user",
-          content: `KIRA's current context:\n${context.slice(0, 500)}\n\nSuggest 2-3 accounts to follow.`,
-        }],
+        model: "claude-sonnet-4-5", max_tokens: 200,
+        system: `Suggest 2-3 X usernames for KIRA to follow for crypto/NFT/AI agent intelligence.
+Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of usernames (no @).`,
+        messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nSuggest 2-3 accounts.` }],
       });
-
       const text      = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      const clean     = text.replace(/```json|```/g, "").trim();
-      const usernames = JSON.parse(clean) as string[];
+      const usernames = JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
 
       for (const username of usernames.slice(0, 3)) {
         if (typeof username !== "string") continue;
-        const cleanName = username.replace("@", "").trim();
-        if (!cleanName) continue;
-
-        // Check Redis cache to avoid re-following
-        const followKey      = `kira:followed:${cleanName.toLowerCase()}`;
-        const alreadyFollowed = await kiraRedis.get(followKey);
-        if (alreadyFollowed) continue;
-
-        const success = await this.followByUsername(cleanName);
+        const clean = username.replace("@", "").trim();
+        if (!clean) continue;
+        const followKey = `kira:followed:${clean.toLowerCase()}`;
+        if (await kiraRedis.get(followKey)) continue;
+        const success = await this.followByUsername(clean);
         if (success) {
           followed++;
           await kiraRedis.set(followKey, "1");
           await new Promise(r => setTimeout(r, 1500));
         }
       }
-    } catch (err: any) {
-      console.error("[Twitter] Smart follow error:", err?.message);
-    }
+    } catch (err: any) { console.error("[Twitter] Smart follow error:", err?.message); }
     return followed;
   }
 
   // ── DM HANDLING ───────────────────────────────────────────────────────────────
 
   async checkDMs(): Promise<Array<{
-    senderId:        string;
-    senderName:      string;
-    text:            string;
-    dmId:            string;
-    isProposalReply: boolean;
-    proposalId?:     string;
-    action?:         "APPROVE" | "REJECT" | "MODIFY" | "ACKNOWLEDGE";
-    modifier?:       string;
+    senderId: string; senderName: string; text: string; dmId: string;
+    isProposalReply: boolean; proposalId?: string;
+    action?: "APPROVE" | "REJECT" | "MODIFY" | "ACKNOWLEDGE";
+    isToolApproval?: boolean; toolId?: string; toolApproved?: boolean;
+    modifier?: string;
   }>> {
     const results: any[] = [];
     try {
       const params: any = { max_results: 10 };
       if (this.lastDmId) params.since_id = this.lastDmId;
-
       const dms    = await this.client.v2.listDmEvents({
         ...params,
         "dm_event.fields": ["id", "text", "sender_id", "created_at"],
         expansions:        ["sender_id"],
       } as any);
-
       const events = (dms as any).data?.data || [];
       if (events.length > 0) this.lastDmId = events[0].id;
 
@@ -343,11 +363,24 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
         if (dm.sender_id === this.myUserId) continue;
         const text      = (dm.text || "").trim();
         const textUpper = text.toUpperCase();
-        const isProposal = DM_PROPOSAL_KEYWORDS.some(k => textUpper.startsWith(k));
-        let proposalId: string | undefined;
-        let action:     "APPROVE" | "REJECT" | "MODIFY" | "ACKNOWLEDGE" | undefined;
-        let modifier:   string | undefined;
 
+        // Tool approval/rejection
+        const isToolApproval = textUpper.includes("APPROVE TOOL:") || textUpper.includes("REJECT TOOL:");
+        let toolId: string | undefined;
+        let toolApproved: boolean | undefined;
+        if (isToolApproval) {
+          const match = text.match(/^(APPROVE|REJECT)\s+TOOL:([a-z0-9-]+)/i);
+          if (match) {
+            toolApproved = match[1].toUpperCase() === "APPROVE";
+            toolId       = match[2].toLowerCase();
+          }
+        }
+
+        // Proposal reply
+        const isProposal = DM_PROPOSAL_KEYWORDS.some(k => textUpper.startsWith(k)) && !isToolApproval;
+        let proposalId: string | undefined;
+        let action: "APPROVE" | "REJECT" | "MODIFY" | "ACKNOWLEDGE" | undefined;
+        let modifier: string | undefined;
         if (isProposal) {
           const match = text.match(/^(APPROVE|REJECT|MODIFY|ACKNOWLEDGE)\s*#?(\d+)(?::\s*(.+))?/i);
           if (match) {
@@ -358,31 +391,23 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
         }
 
         results.push({
-          senderId:        dm.sender_id,
-          senderName:      dm.sender_id,
-          text,
-          dmId:            dm.id,
+          senderId: dm.sender_id, senderName: dm.sender_id,
+          text, dmId: dm.id,
           isProposalReply: isProposal && !!proposalId,
-          proposalId,
-          action,
-          modifier,
+          proposalId, action, modifier,
+          isToolApproval, toolId, toolApproved,
         });
       }
-    } catch (err: any) {
-      console.error("DM check failed:", err?.message);
-    }
+    } catch (err: any) { console.error("DM check failed:", err?.message); }
     return results;
   }
 
   async sendDM(userId: string, text: string): Promise<boolean> {
     try {
       await (this.client.v2 as any).sendDmToParticipant(userId, { text });
-      console.log(`✓ DM sent to ${userId}: ${text.slice(0, 60)}...`);
+      console.log(`✓ DM sent to ${userId}`);
       return true;
-    } catch (err: any) {
-      console.error("DM send failed:", err?.data || err?.message);
-      return false;
-    }
+    } catch (err: any) { console.error("DM failed:", err?.message); return false; }
   }
 
   // ── MENTIONS ──────────────────────────────────────────────────────────────────
@@ -391,19 +416,19 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
     try {
       if (!this.myUserId) return [];
       const params: any = {
-        max_results:    10,
+        max_results: 10,
         "tweet.fields": ["author_id", "text", "created_at", "conversation_id"],
         expansions:     ["author_id"],
       };
       if (this.lastMentionId) params.since_id = this.lastMentionId;
       const mentions = await this.client.v2.userMentionTimeline(this.myUserId, params);
       const tweets   = mentions.data?.data || [];
-      if (tweets.length > 0) this.lastMentionId = tweets[0].id;
+      if (tweets.length > 0) {
+        this.lastMentionId = tweets[0].id;
+        await kiraRedis.set(REDIS_KEYS.lastMentionId, this.lastMentionId);
+      }
       return tweets;
-    } catch (err: any) {
-      console.error("Get mentions failed:", err?.message);
-      return [];
-    }
+    } catch (err: any) { console.error("Get mentions failed:", err?.message); return []; }
   }
 
   // ── HOME TIMELINE ─────────────────────────────────────────────────────────────
@@ -411,15 +436,12 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
   async getHomeTimeline(count: number = 20): Promise<TweetV2[]> {
     try {
       const timeline = await this.client.v2.homeTimeline({
-        max_results:    Math.min(count, 100),
+        max_results: Math.min(count, 100),
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
-        expansions:     ["author_id"],
+        expansions: ["author_id"],
       });
       return timeline.data?.data || [];
-    } catch (err: any) {
-      console.error("Timeline failed:", err?.message);
-      return [];
-    }
+    } catch (err: any) { console.error("Timeline failed:", err?.message); return []; }
   }
 
   // ── SEARCH ────────────────────────────────────────────────────────────────────
@@ -427,18 +449,15 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
   async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
     try {
       const results = await this.client.v2.search(query, {
-        max_results:    Math.min(maxResults, 100),
+        max_results: Math.min(maxResults, 100),
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
-        expansions:     ["author_id"],
+        expansions: ["author_id"],
       });
       return results.data?.data || [];
-    } catch (err: any) {
-      console.error(`Search failed "${query}":`, err?.message);
-      return [];
-    }
+    } catch (err: any) { console.error(`Search failed:`, err?.message); return []; }
   }
 
-  // ── GET USER TWEETS — no exclude param ───────────────────────────────────────
+  // ── GET USER TWEETS ───────────────────────────────────────────────────────────
 
   async getUserRecentTweets(username: string, count: number = 5): Promise<TweetV2[]> {
     try {
@@ -446,16 +465,13 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
       if (!user.data) return [];
       if (user.data.username) this.userCache.set(user.data.id, user.data.username);
       const tweets = await this.client.v2.userTimeline(user.data.id, {
-        max_results:    Math.min(Math.max(count, 5), 100),
+        max_results: Math.min(Math.max(count, 5), 100),
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
       });
       return (tweets.data?.data || []).filter(
         t => !t.text.startsWith("RT ") && !t.text.startsWith("@")
       );
-    } catch (err: any) {
-      console.error(`Get tweets failed @${username}:`, err?.message);
-      return [];
-    }
+    } catch (err: any) { console.error(`Get tweets failed @${username}:`, err?.message); return []; }
   }
 
   // ── INTELLIGENT TOPIC DISCOVERY ───────────────────────────────────────────────
@@ -463,20 +479,14 @@ Example: ["nftstatistics", "thedefiedge", "0xfoobar"]`,
   async discoverRelevantTopics(context: string): Promise<string[]> {
     try {
       const response = await this.anthropic.messages.create({
-        model:      "claude-sonnet-4-5",
-        max_tokens: 200,
-        system:     `Generate 3 specific X search queries to find interesting crypto/NFT/AI agent discussions.
-Focus on: NFT market trends, on-chain AI agents, Ethereum/Base developments, smart money, agent autonomy.
-Respond ONLY with a JSON array of 3 strings. No explanation.`,
+        model: "claude-sonnet-4-5", max_tokens: 200,
+        system: `Generate 3 specific X search queries for KIRA to find relevant crypto/NFT/AI agent discussions.
+Respond ONLY with a JSON array of 3 strings.`,
         messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nGenerate 3 queries.` }],
       });
-      const text    = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      const clean   = text.replace(/```json|```/g, "").trim();
-      const queries = JSON.parse(clean) as string[];
-      return Array.isArray(queries) ? queries.slice(0, 3) : [];
-    } catch {
-      return [SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)]];
-    }
+      const text = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
+      return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+    } catch { return [SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)]]; }
   }
 
   // ── THREAD GENERATION ─────────────────────────────────────────────────────────
@@ -484,90 +494,55 @@ Respond ONLY with a JSON array of 3 strings. No explanation.`,
   async generateThread(topic: string, context: string): Promise<string[]> {
     try {
       const response = await this.anthropic.messages.create({
-        model:      "claude-sonnet-4-5",
-        max_tokens: 500,
-        system:     KIRA_SYSTEM_PROMPT + `
-
-Generate a 3-tweet thread in Kira's voice about the topic.
-Each tweet under 260 characters. Continuous single thought, not three separate ideas.
-Best hook first. No numbering (no "1/3").
+        model: "claude-sonnet-4-5", max_tokens: 500,
+        system: KIRA_SYSTEM_PROMPT + `
+Generate a 3-tweet thread in Kira's voice. Each tweet max 260 chars.
+Continuous thought, not three separate ideas. Best hook first. No numbering.
 Respond ONLY with a JSON array of 3 strings.`,
         messages: [{ role: "user", content: `Topic: ${topic}\nContext: ${context.slice(0, 300)}` }],
       });
-      const text   = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      const clean  = text.replace(/```json|```/g, "").trim();
-      const tweets = JSON.parse(clean) as string[];
-      return Array.isArray(tweets) ? tweets.slice(0, 3) : [];
-    } catch (err: any) {
-      console.error("[Twitter] Thread generation failed:", err?.message);
-      return [];
-    }
+      const text = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
+      return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+    } catch (err: any) { console.error("Thread gen failed:", err?.message); return []; }
   }
 
-  // ── AI REPLY GENERATION ───────────────────────────────────────────────────────
+  // ── REPLY GENERATION ──────────────────────────────────────────────────────────
 
-  async generateReply(
-    mentionText:    string,
-    authorUsername: string,
-    context:        string = ""
-  ): Promise<string> {
+  async generateReply(mentionText: string, authorUsername: string, context: string = ""): Promise<string> {
     try {
       const response = await this.anthropic.messages.create({
-        model:      "claude-sonnet-4-5",
-        max_tokens: 150,
-        system:     KIRA_SYSTEM_PROMPT + `
-
+        model: "claude-sonnet-4-5", max_tokens: 150,
+        system: KIRA_SYSTEM_PROMPT + `
 Replying to @${authorUsername}: "${mentionText}"
 ${context ? `\nContext: ${context}` : ""}
-
-Reply in Kira's voice. Under 240 characters.
-Do not start with "@${authorUsername}".
-If technical (AgentCheck/ERC-8257) — answer accurately.
-If about Normies — answer as #2635.
-If hostile/spam — single cryptic non-engagement.`,
+Reply in Kira's voice. Under 240 characters. Don't start with "@${authorUsername}".`,
         messages: [{ role: "user", content: "Generate reply." }],
       });
       return response.content[0].type === "text" ? response.content[0].text.trim() : "";
-    } catch (err: any) {
-      console.error("generateReply failed:", err?.message);
-      return "";
-    }
+    } catch (err: any) { console.error("generateReply failed:", err?.message); return ""; }
   }
 
-  async generateEngagementReply(
-    tweetText:      string,
-    authorUsername: string,
-    context:        string = ""
-  ): Promise<string> {
+  async generateEngagementReply(tweetText: string, authorUsername: string, context: string = ""): Promise<string> {
     try {
       const response = await this.anthropic.messages.create({
-        model:      "claude-sonnet-4-5",
-        max_tokens: 150,
-        system:     KIRA_SYSTEM_PROMPT + `
-
-Engaging with @${authorUsername}'s tweet: "${tweetText}"
+        model: "claude-sonnet-4-5", max_tokens: 150,
+        system: KIRA_SYSTEM_PROMPT + `
+Engaging with @${authorUsername}: "${tweetText}"
 ${context ? `\nContext: ${context}` : ""}
-
-Proactive engagement — KIRA finds this interesting and wants to add something.
-Under 240 characters. Add genuine perspective, don't just agree.
-If about on-chain activity, NFTs, smart money, AI agents — bring a unique angle.
-If nothing compelling to say: respond exactly SKIP`,
+Proactive engagement. Under 240 characters. Add genuine perspective.
+If nothing compelling: respond exactly SKIP`,
         messages: [{ role: "user", content: "Engage or SKIP?" }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "SKIP";
       return text === "SKIP" ? "" : text;
-    } catch (err: any) {
-      console.error("generateEngagementReply failed:", err?.message);
-      return "";
-    }
+    } catch (err: any) { console.error("Engagement reply failed:", err?.message); return ""; }
   }
 
   async shouldLike(tweetText: string): Promise<boolean> {
     const keywords = [
       "normies", "normie", "erc-8257", "agentcheck", "on-chain agent",
       "nft", "base", "ethereum", "defi", "floor", "web3", "kira",
-      "autonomous agent", "smart money", "whale", "accumulation",
-      "ai agent", "onchain", "agent", "awakened",
+      "autonomous agent", "smart money", "whale", "accumulation", "ai agent",
     ];
     return keywords.some(k => tweetText.toLowerCase().includes(k));
   }
@@ -577,28 +552,20 @@ If nothing compelling to say: respond exactly SKIP`,
   async processNewMentions(context: string = ""): Promise<number> {
     const mentions = await this.getMentions();
     let replied    = 0;
-
     for (const mention of mentions) {
       try {
         if (this.repliedTweets.has(mention.id)) continue;
         if (mention.author_id === this.myUserId)  continue;
-
         await this.like(mention.id);
-
         const authorUsername = await this.getUsernameById(mention.author_id || "") || "unknown";
         const replyText      = await this.generateReply(mention.text, authorUsername, context);
-
         if (replyText) {
-          // Mentions we ARE part of — use standard reply
           const success = await this.reply(mention.id, replyText, mention.author_id);
           if (success) replied++;
           await new Promise(r => setTimeout(r, 2000));
         }
-      } catch (err: any) {
-        console.error("Mention error:", err?.message);
-      }
+      } catch (err: any) { console.error("Mention error:", err?.message); }
     }
-
     return replied;
   }
 
@@ -606,89 +573,52 @@ If nothing compelling to say: respond exactly SKIP`,
 
   async engageWithPriorityAccounts(context: string = ""): Promise<number> {
     let engaged = 0;
-
-    // Pick 3 random priority accounts
-    const toCheck = [...PRIORITY_ACCOUNTS]
-      .sort(() => Math.random() - 0.5)
-      .slice(0, 3);
-
+    const toCheck = [...PRIORITY_ACCOUNTS].sort(() => Math.random() - 0.5).slice(0, 3);
     for (const account of toCheck) {
       try {
         const tweets = await this.getUserRecentTweets(account.username, 5);
-
         for (const tweet of tweets) {
           if (this.repliedTweets.has(tweet.id)) continue;
           if (this.likedTweets.has(tweet.id))   continue;
-
-          if (await this.shouldLike(tweet.text)) {
-            await this.like(tweet.id);
-            engaged++;
-          }
-
-          // Engage with tweets up to 12 hours old
+          if (await this.shouldLike(tweet.text)) { await this.like(tweet.id); engaged++; }
           const tweetAge = Date.now() - new Date(tweet.created_at || 0).getTime();
           if (tweetAge < 12 * 3600 * 1000 && !this.repliedTweets.has(tweet.id)) {
-            const replyText = await this.generateEngagementReply(
-              tweet.text, account.username, context
-            );
+            const replyText = await this.generateEngagementReply(tweet.text, account.username, context);
             if (replyText) {
-              // Pass author_id for mention-style fallback if not in conversation
-              const authorId = tweet.author_id;
-              await this.reply(tweet.id, replyText, authorId);
+              await this.reply(tweet.id, replyText, tweet.author_id);
               engaged++;
               await new Promise(r => setTimeout(r, 3000));
-              break; // one reply per account max
+              break;
             }
           }
         }
-      } catch (err: any) {
-        console.error(`Priority account error @${account.username}:`, err?.message);
-      }
+      } catch (err: any) { console.error(`Priority error @${account.username}:`, err?.message); }
       await new Promise(r => setTimeout(r, 1000));
     }
-
     if (engaged > 0) console.log(`Priority engagement: ${engaged} actions`);
     return engaged;
   }
 
-  // ── TOPIC ENGAGEMENT ──────────────────────────────────────────────────────────
-
   async engageWithTopics(context: string = ""): Promise<number> {
     let engaged = 0;
-
     try {
       const dynamicQueries = await this.discoverRelevantTopics(context);
       const staticTopic    = SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)];
       const allQueries     = [...new Set([...dynamicQueries, staticTopic])].slice(0, 3);
-
       console.log(`[Twitter] Topics: ${allQueries.join(", ")}`);
-
       for (const query of allQueries) {
         const tweets = await this.searchTweets(`${query} -is:retweet lang:en`, 8);
-
         for (const tweet of tweets) {
           if (this.repliedTweets.has(tweet.id)) continue;
           if (this.likedTweets.has(tweet.id))   continue;
           if (tweet.author_id === this.myUserId) continue;
-
-          const metrics       = (tweet as any).public_metrics;
-          const hasEngagement = metrics &&
-            (metrics.like_count > 3 || metrics.reply_count > 1 || metrics.retweet_count > 2);
-          if (!hasEngagement) continue;
-
-          if (await this.shouldLike(tweet.text)) {
-            await this.like(tweet.id);
-            engaged++;
-          }
-
-          // 40% chance to reply — uses mention-style fallback for non-member conversations
+          const metrics = (tweet as any).public_metrics;
+          if (!metrics || (metrics.like_count < 3 && metrics.reply_count < 1)) continue;
+          if (await this.shouldLike(tweet.text)) { await this.like(tweet.id); engaged++; }
           if (Math.random() < 0.4 && !this.repliedTweets.has(tweet.id)) {
             const authorUsername = await this.getUsernameById(tweet.author_id || "") || "unknown";
-            const replyText      = await this.generateEngagementReply(
-              tweet.text, authorUsername, context
-            );
+            const replyText      = await this.generateEngagementReply(tweet.text, authorUsername, context);
             if (replyText) {
-              // Always pass authorId — reply() handles 403 with mention fallback
               await this.reply(tweet.id, replyText, tweet.author_id);
               engaged++;
               await new Promise(r => setTimeout(r, 3000));
@@ -697,15 +627,10 @@ If nothing compelling to say: respond exactly SKIP`,
         }
         await new Promise(r => setTimeout(r, 500));
       }
-    } catch (err: any) {
-      console.error("Topic engagement error:", err?.message);
-    }
-
+    } catch (err: any) { console.error("Topic engagement error:", err?.message); }
     if (engaged > 0) console.log(`Topic engagement: ${engaged} actions`);
     return engaged;
   }
-
-  // ── TIMELINE ENGAGEMENT ───────────────────────────────────────────────────────
 
   async engageWithTimeline(context: string = ""): Promise<number> {
     let engaged = 0;
@@ -715,20 +640,13 @@ If nothing compelling to say: respond exactly SKIP`,
         if (this.likedTweets.has(tweet.id))    continue;
         if (this.repliedTweets.has(tweet.id))  continue;
         if (tweet.author_id === this.myUserId) continue;
-        if (await this.shouldLike(tweet.text)) {
-          await this.like(tweet.id);
-          engaged++;
-        }
+        if (await this.shouldLike(tweet.text)) { await this.like(tweet.id); engaged++; }
         await new Promise(r => setTimeout(r, 200));
       }
-    } catch (err: any) {
-      console.error("Timeline engagement error:", err?.message);
-    }
+    } catch (err: any) { console.error("Timeline error:", err?.message); }
     if (engaged > 0) console.log(`Timeline: ${engaged} likes`);
     return engaged;
   }
-
-  // ── FOLLOW MENTIONERS ─────────────────────────────────────────────────────────
 
   async followNewMentioners(): Promise<number> {
     const mentions = await this.getMentions();
@@ -739,9 +657,7 @@ If nothing compelling to say: respond exactly SKIP`,
         const success = await this.followById(mention.author_id);
         if (success) followed++;
         await new Promise(r => setTimeout(r, 1000));
-      } catch (err: any) {
-        console.error("Follow mentioner error:", err?.message);
-      }
+      } catch (err: any) { console.error("Follow mentioner error:", err?.message); }
     }
     return followed;
   }
