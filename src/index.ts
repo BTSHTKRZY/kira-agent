@@ -768,11 +768,11 @@ async function backgroundTasks(): Promise<void> {
     }
   }
 
-  // Auto follow mentioners hourly
-  if (state.xApiAvailable && now - state.lastMentionCheck > 60 * 60 * 1000) {
+  // Auto follow mentioners once per day only
+  if (state.xApiAvailable && now - state.lastMentionCheck > 24 * 60 * 60 * 1000) {
     try { await twitter.followNewMentioners(); } catch {}
   }
-
+  
   // Timeline engagement every 2 hours
   if (state.xApiAvailable && now - state.lastTimelineEngage > 2 * 60 * 60 * 1000) {
     try {
@@ -781,8 +781,8 @@ async function backgroundTasks(): Promise<void> {
     } catch {}
   }
 
-  // Smart follow every 6 hours
-  if (state.xApiAvailable && now - state.lastSmartFollow > 6 * 60 * 60 * 1000) {
+  // Smart follow every 12 hours — quality over quantity
+  if (state.xApiAvailable && now - state.lastSmartFollow > 12 * 60 * 60 * 1000) {
     try {
       const context = state.recentLearnings.slice(-5).join(" ");
       const followed = await twitter.smartFollow(context);
