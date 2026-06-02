@@ -17,7 +17,7 @@ const KIRA_WALLET        = process.env.KIRA_WALLET || "";
 const KIRA_PRIVATE_KEY   = process.env.KIRA_PRIVATE_KEY || "";
 
 // Minimum ETH to keep liquid for gas + trades
-const MIN_LIQUID_ETH     = 0.005;
+const MIN_LIQUID_ETH = parseFloat(process.env.MIN_OPERATING_BALANCE_ETH || "0.02");
 // Minimum idle ETH before depositing (not worth gas otherwise)
 const MIN_DEPOSIT_ETH    = 0.005;
 
