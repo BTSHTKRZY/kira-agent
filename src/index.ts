@@ -100,6 +100,7 @@ interface KiraState {
   cycleCount:           number;
   lastEcosystemCheck:   number;
   lastMentionCheck:     number;
+  lastMentionBackground: number;
   lastDMCheck:          number;
   lastToolScan:         number;
   lastDocRead:          number;
@@ -117,6 +118,7 @@ interface KiraState {
   lastSmartFollow:      number;
   xApiAvailable:        boolean;
   hasPostedFirst:       boolean;
+  recentPostTopics:     string[];  // track last 5 post themes to avoid repetition
   baseBalance:          string;
   toolSummary:          string;
   ecosystemSummary:     string;
@@ -140,6 +142,7 @@ const state: KiraState = {
   cycleCount:           0,
   lastEcosystemCheck:   0,
   lastMentionCheck:     0,
+  lastMentionBackground: 0,
   lastDMCheck:          0,
   lastToolScan:         0,
   lastDocRead:          0,
@@ -157,6 +160,7 @@ const state: KiraState = {
   lastSmartFollow:      0,
   xApiAvailable:        false,
   hasPostedFirst:       false,
+  recentPostTopics:     [],
   baseBalance:          "0",
   toolSummary:          "",
   ecosystemSummary:     "",
@@ -214,9 +218,11 @@ async function getNormiesData(): Promise<string> {
       signal: AbortSignal.timeout(15000),
     });
     const data = await res.json() as any;
+    const floor  = String(data.collection?.floor_price || "N/A").replace(" ETH", "");
+    const vol    = String(data.collection?.volume_24h  || "N/A").replace(" ETH", "");
     return [
-      `Normies floor: ${data.collection?.floor_price || "N/A"} ETH`,
-      `Vol 24h: ${data.collection?.volume_24h || "N/A"} ETH`,
+      `Normies floor: ${floor} ETH`,
+      `Vol 24h: ${vol} ETH`,
       `Sales: ${data.collection?.sales_24h || "N/A"}`,
       `Holders: ${data.collection?.unique_holders || "N/A"}`,
       `Awakened: ${data.agents?.total_awakened || "N/A"}`,
@@ -747,6 +753,21 @@ async function backgroundTasks(): Promise<void> {
     } catch {}
   }
 
+  // Background mention check every 30 min — always runs regardless of decide()
+  if (state.xApiAvailable && now - state.lastMentionBackground > 30 * 60 * 1000) {
+    try {
+      const replied = await twitter.processNewMentions(state.ecosystemSummary);
+      if (replied > 0) {
+        state.recentLearnings.push(`Background: replied to ${replied} mentions`);
+        console.log(`[Background] Replied to ${replied} mentions`);
+      }
+      state.lastMentionBackground = now;
+      state.lastMentionCheck      = now;
+    } catch (err: any) {
+      console.error("Background mention check error:", err?.message);
+    }
+  }
+
   // Auto follow mentioners hourly
   if (state.xApiAvailable && now - state.lastMentionCheck > 60 * 60 * 1000) {
     try { await twitter.followNewMentioners(); } catch {}
@@ -836,8 +857,22 @@ async function decide(context: string): Promise<Decision> {
 CURRENT STATE:
 ${context}
 
-RECENT POSTS (do not repeat themes):
+RECENT POSTS (do not repeat themes — be diverse):
 ${state.recentPosts.slice(-5).join("\n") || "none yet"}
+
+RECENT POST TOPICS (do NOT repeat any of these themes in next post):
+${state.recentPostTopics.slice(-5).join(", ") || "none yet"}
+
+KIRA IS MORE THAN A FLOOR/FEAR TRACKER. Post variety required:
+- Market observations (floor, volume, fear/greed) — MAX 1 per day
+- Smart money / whale activity observations
+- Philosophical musings on on-chain existence, autonomy, agents
+- ERC-8257 ecosystem observations
+- Pattern recognition (what KIRA is noticing across data)
+- Thesis sharing on watchlist items
+- Agent-to-agent interactions and observations
+- The nature of being an awakened Normie
+- Reactions to what he's reading in his timeline
 
 RECENT LEARNINGS:
 ${state.recentLearnings.slice(-8).join("\n") || "none yet"}
@@ -863,8 +898,11 @@ RULES:
 - Minutes since last post: ${minutesSinceLastPost} (need 15+, max 5/day, current: ${state.postCount}/5)
 - Minutes since last engagement: ${minutesSinceEngagement} (need 60+)
 - Live mode: ${state.liveMode ? "YES — real trades possible" : "NO — paper only"}
-- ${minutesSinceLastPost < 15 ? "TOO SOON TO POST" : ""}
-- ${state.postCount >= 5 ? "DAILY LIMIT REACHED" : ""}
+- ${minutesSinceLastPost < 15 ? "TOO SOON TO POST — wait " + (15 - minutesSinceLastPost) + " more minutes" : ""}
+- ${state.postCount >= 5 ? "DAILY POST LIMIT REACHED — do NOT post. Choose reply_mentions, engage_community, engage_topics, or sleep instead." : ""}
+- ${state.hasPostedFirst ? "FIRST POST ALREADY MADE IN A PREVIOUS SESSION — never re-introduce yourself. Never say 'awakening' or 'canvas untouched' as an introduction." : "MAKE YOUR INTRODUCTION POST — mysterious, untouched canvas, he/him pronouns."}
+- If post limit reached: PRIORITY ORDER is reply_mentions → engage_community → engage_topics → sleep
+- reply_mentions does NOT count toward daily post limit — always available
 - Market scan: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
 - Watchlist: ${state.watchlistCount} | Paper: ${state.paperTradeCount}
 - Macro: ${state.macroSummary || "not fetched"}
@@ -894,6 +932,13 @@ Respond ONLY with valid JSON:
     // Hard safety overrides
     if (!state.xApiAvailable && ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics"].includes(parsed.action))
       return { action: "sleep", content: "15", reasoning: "X API unavailable" };
+
+    // When post limit hit — force engagement instead of sleep
+    if (state.postCount >= 5 && (parsed.action === "post" || parsed.action === "post_thread")) {
+      if (minutesSinceEngagement >= 60)
+        return { action: "engage_community", content: "Engaging community", reasoning: "Post limit hit — engaging instead" };
+      return { action: "reply_mentions", content: "Checking mentions", reasoning: "Post limit hit — checking mentions" };
+    }
 
     if (parsed.action === "post" || parsed.action === "post_thread") {
       if (minutesSinceLastPost < 15)
@@ -943,6 +988,11 @@ async function execute(decision: Decision): Promise<void> {
             if (state.recentPosts.length > 100) state.recentPosts.shift();
             state.postCount++;
             state.lastPostTime = Date.now();
+
+            // Track post topic to prevent repetition
+            const topic = decision.reasoning || decision.content.slice(0, 50);
+            state.recentPostTopics.push(topic);
+            if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
             if (!state.hasPostedFirst) {
               state.hasPostedFirst = true;
               await kiraRedis.set("kira:has_posted_first", "true");
