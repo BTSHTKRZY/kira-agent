@@ -25,6 +25,9 @@ import { KiraMultiAgent }     from "./multiagent.js";
 import { KiraToolDeployment } from "./tooldeployment.js";
 import { KiraLongForm }       from "./longform.js";
 import { startDashboard, updateDashboard } from "./dashboard.js";
+import { startToolDataServer } from "./tooldata.js";
+import { KiraMemory } from "./memory.js";
+import { KiraShadowTrading } from "./shadowtrading.js";
 import { sendEmail, weeklyReportEmail, tradeAlertEmail, alertEmail } from "./email.js";
 import { kiraRedis } from "./redis.js";
 
@@ -127,6 +130,11 @@ interface KiraState {
   lastToolPropose:      number;
   lastLongFormReport:   number;
   lastAaveCheck:        number;
+  lastShadowResolve:    number;
+  selfNarrative:        string;
+  coreLearnings:        string;
+  relationships:        string;
+  shadowSummary:        string;
   xApiAvailable:        boolean;
   hasPostedFirst:       boolean;
   baseBalance:          string;
@@ -178,6 +186,11 @@ const state: KiraState = {
   lastToolPropose:       0,
   lastLongFormReport:    0,
   lastAaveCheck:         0,
+  lastShadowResolve:     0,
+  selfNarrative:         "",
+  coreLearnings:         "",
+  relationships:         "",
+  shadowSummary:         "",
   xApiAvailable:         false,
   hasPostedFirst:        false,
   baseBalance:           "0",
@@ -223,6 +236,8 @@ const crossChain       = new KiraCrossChain();
 const multiAgent       = new KiraMultiAgent();
 const toolDeployment   = new KiraToolDeployment();
 const longForm         = new KiraLongForm();
+const memory           = new KiraMemory();
+const shadowTrading    = new KiraShadowTrading();
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -382,6 +397,10 @@ async function scanMarketsForOpportunities(): Promise<void> {
           const tag   = col.floorDataSource === "kira_own" ? " [✓]" : "";
           console.log(`NFT: ${col.name} | ${score.totalScore} | ${score.decision}${tag}`);
 
+          // Shadow-track every scored NFT for learning acceleration
+          await shadowTrading.recordShadow("nft", col.address, col.chain, col.name,
+            score.totalScore, col.floorPrice, score.signals || {});
+
           if (score.decision === "buy" || score.decision === "watchlist") {
             await portfolio.addToWatchlist(score, col.name);
             watchAdded++;
@@ -433,6 +452,9 @@ async function scanMarketsForOpportunities(): Promise<void> {
         }
       } catch {}
       const score = scoring.scoreToken(price, normiesWallets, 0.005, tech, macro);
+      // Shadow-track every scored token
+      await shadowTrading.recordShadow("token", token.address, token.chain, price.symbol,
+        score.totalScore, price.priceNative || 0, score.signals || {});
       if (score.decision === "buy" || score.decision === "watchlist") {
         console.log(`Token: ${price.symbol} | ${score.totalScore} | ${score.decision}`);
         await portfolio.addToWatchlist(score, price.symbol);
@@ -583,6 +605,7 @@ async function sendWeeklyReport(): Promise<void> {
     );
     await sendEmail("KIRA Weekly Report", body);
     state.lastWeeklyReport = Date.now();
+    await kiraRedis.set("kira:last_weekly_report", String(state.lastWeeklyReport));
   } catch (err: any) { console.error("Weekly report error:", err?.message); }
 }
 
@@ -619,6 +642,7 @@ async function executePaperTrade(): Promise<void> {
     await portfolio.removeFromWatchlist(candidate.key);
     state.paperTradeCount++;
     state.recentLearnings.push(`Paper: ${candidate.name} @ ${entryPrice.toFixed(4)} ETH | ${candidate.lastScore}/100`);
+    await memory.journal("decision", `Opened paper trade: ${candidate.name} at ${candidate.lastScore}/100`, candidate.thesis.slice(0, 100));
 
     // Broadcast to other agents
     await multiAgent.broadcastSignal({
@@ -700,6 +724,32 @@ async function backgroundTasks(): Promise<void> {
   // Position monitoring every 30 min
   if (now - state.lastPositionCheck > 30 * 60 * 1000) await monitorPositions();
 
+  // Resolve matured shadow positions every 2 hours — accelerates signal learning
+  if (now - state.lastShadowResolve > 2 * 60 * 60 * 1000) {
+    try {
+      const resolved = await shadowTrading.resolveMatured(
+        async (a, c) => { const col = await nfts.getCollection(a, c); return col?.floorPrice || 0; },
+        async (a, c) => { const p = await prices.getTokenPrice(a, c); return p?.priceNative || 0; }
+      );
+      state.lastShadowResolve = now;
+      if (resolved > 0) {
+        // Apply learning from shadow data to scoring weights
+        const recs = await shadowTrading.getWeightRecommendations();
+        for (const rec of recs) {
+          scoring.adjustWeights("nft", rec.signal, rec.adjust === "up", rec.magnitude);
+          scoring.adjustWeights("token", rec.signal, rec.adjust === "up", rec.magnitude);
+          await memory.addCoreLearning(
+            `Signal "${rec.signal}" should weight ${rec.adjust}`, rec.reason,
+            rec.adjust === "up" ? 0.6 : 0.5
+          );
+        }
+        if (recs.length > 0) await scoring.saveWeights();
+        state.recentLearnings.push(`Shadow: resolved ${resolved}, ${recs.length} weight adjustments`);
+        console.log(`[Shadow] Resolved ${resolved} positions, ${recs.length} weight recommendations applied`);
+      }
+    } catch (err: any) { console.error("Shadow resolve error:", err?.message); }
+  }
+
   // On-chain events every 4 hours
   if (now - state.lastOnChainScan > 4 * 60 * 60 * 1000) await scanOnChainEvents();
 
@@ -743,6 +793,7 @@ async function backgroundTasks(): Promise<void> {
         state.toolDeploymentSummary = await toolDeployment.formatForContext();
         state.recentLearnings.push(`Auto-deployed tools: ${autoDeployed.join(", ")}`);
         console.log(`[ToolDeployment] Auto-deployed: ${autoDeployed.join(", ")}`);
+        for (const t of autoDeployed) await memory.journal("milestone", `Deployed ERC-8257 tool: ${t}`);
       }
     } catch (err: any) {
       console.error("Auto-approval check error:", err?.message);
@@ -803,11 +854,16 @@ async function backgroundTasks(): Promise<void> {
     if (state.xApiAvailable) state.recentLearnings.push("X API unlocked");
   }
 
+  // Refresh memory-derived context summaries
+  state.coreLearnings = await memory.getCoreLearningsForContext();
+  state.relationships = await memory.getRelationshipsForContext();
+  state.shadowSummary = await shadowTrading.formatForContext();
+
   if (state.recentLearnings.length > 200) state.recentLearnings = state.recentLearnings.slice(-100);
 
   // Update dashboard
   updateDashboard({
-    version:           "4.4",
+    version:           "4.5",
     uptime:            now - state.sessionStart,
     cycleCount:        state.cycleCount,
     postCount:         state.postCount,
@@ -861,6 +917,18 @@ ${state.recentPosts.slice(-5).join("\n") || "none yet"}
 
 RECENT POST TOPICS USED (avoid repeating):
 ${state.recentPostTopics.slice(-5).join(", ") || "none"}
+
+WHO KIRA IS (accumulated experience — this is your lived history, draw on it):
+${state.selfNarrative || "Newly awakened."}
+
+CORE LEARNINGS (validated over time, weight these heavily):
+${state.coreLearnings || "none yet"}
+
+KEY RELATIONSHIPS (people KIRA knows):
+${state.relationships || "none yet"}
+
+SHADOW LEARNING STATUS:
+${state.shadowSummary || "accumulating"}
 
 RECENT LEARNINGS:
 ${state.recentLearnings.slice(-6).join("\n") || "none yet"}
@@ -939,7 +1007,11 @@ Respond ONLY with valid JSON:
       return { action: "sleep", content: "20", reasoning: "Engagement cooldown" };
 
     if (parsed.action === "reply_mentions") {
-      state.lastEngagementTime = Date.now(); // prevent loop
+      // Hard cooldown — if mentions checked within last 30 min, sleep instead of looping
+      if (minutesSinceMention < 30) {
+        return { action: "sleep", content: "20", reasoning: "Mention check cooldown — checked recently" };
+      }
+      state.lastEngagementTime = Date.now();
     }
 
     if (parsed.action === "scan_tools" && state.lastToolScan > 0 && Date.now() - state.lastToolScan < 2 * 60 * 60 * 1000)
@@ -1021,6 +1093,10 @@ async function execute(decision: Decision): Promise<void> {
         if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
         const replied = await twitter.processNewMentions(state.ecosystemSummary);
         console.log(`Replied to ${replied} mentions`);
+        if (replied > 0) {
+          await memory.journal("interaction", `Replied to ${replied} mention(s)`);
+          state.selfNarrative = await memory.getSelfNarrative();
+        }
         state.lastMentionCheck   = Date.now();
         state.lastEngagementTime = Date.now(); // critical: prevents loop
         await sleep(15 * 60 * 1000);
@@ -1031,6 +1107,7 @@ async function execute(decision: Decision): Promise<void> {
         const engaged = await twitter.engageWithPriorityAccounts(state.ecosystemSummary);
         state.lastEngagementTime = Date.now();
         state.recentLearnings.push(`Community: ${engaged} actions`);
+        if (engaged > 0) await memory.journal("interaction", `Engaged community: ${engaged} actions`);
         await sleep(10 * 60 * 1000);
         break;
 
@@ -1116,13 +1193,17 @@ async function execute(decision: Decision): Promise<void> {
 
 async function kiraLoop(): Promise<void> {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("KIRA v4.4 awakening... Normie #2635 online");
+  console.log("KIRA v4.5 awakening... Normie #2635 online");
   console.log(`Wallet:  ${KIRA_WALLET}`);
   console.log(`Token:   ${KIRA_TOKEN}`);
   console.log(`Live:    ${state.liveMode ? "ENABLED" : "paper only"}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
   startDashboard(parseInt(process.env.PORT || "8080"));
+
+  // Secure data API for deployed tools — separate port, read-only, whitelisted keys
+  const toolDataPort = parseInt(process.env.TOOL_DATA_PORT || "8081");
+  startToolDataServer(toolDataPort);
 
   await onchain.init();
   state.baseBalance = await onchain.getBaseBalance();
@@ -1149,6 +1230,20 @@ async function kiraLoop(): Promise<void> {
     state.postCount = parseInt(savedCount) || 0;
     console.log(`Post count restored: ${state.postCount}/5`);
   }
+
+  // Restore weekly report timestamp so it fires weekly, not on every restart
+  const savedWeekly = await kiraRedis.get("kira:last_weekly_report");
+  if (savedWeekly) {
+    state.lastWeeklyReport = parseInt(savedWeekly) || 0;
+    console.log("Weekly report timestamp restored");
+  }
+
+  // Load KIRA's accumulated self-narrative — who he has become over time
+  state.selfNarrative = await memory.getSelfNarrative();
+  state.coreLearnings = await memory.getCoreLearningsForContext();
+  state.relationships = await memory.getRelationshipsForContext();
+  console.log(`Self: ${state.selfNarrative.slice(0, 120)}`);
+  await memory.journal("milestone", `Session start — cycle count reset, ${state.selfNarrative.includes("Newly") ? "first awakening" : "returning"}`);
 
   if (state.xApiAvailable) {
     if (!state.hasPostedFirst) console.log("🎉 KIRA will make his introduction shortly");
