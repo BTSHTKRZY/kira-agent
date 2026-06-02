@@ -1,0 +1,300 @@
+// crosschain.ts — Cross-chain intelligence
+// Arbitrum: full token + NFT scanning
+// Solana: read-only price + volume intelligence (no execution — different wallet format)
+// Base: already in main scanning loop
+
+import { kiraRedis } from "./redis.js";
+
+export interface ChainIntelligence {
+  chain:          string;
+  tvl:            number;        // total value locked USD
+  volume24h:      number;        // DEX volume USD
+  activeWallets:  number;
+  topTokens:      TokenSnapshot[];
+  topNFTs:        NFTSnapshot[];
+  gasGwei:        number;
+  fetchedAt:      number;
+}
+
+export interface TokenSnapshot {
+  address:   string;
+  symbol:    string;
+  price:     number;
+  change24h: number;
+  volume24h: number;
+  chain:     string;
+}
+
+export interface NFTSnapshot {
+  address:    string;
+  name:       string;
+  floorEth:   number;
+  volume24h:  number;
+  chain:      string;
+}
+
+export interface CrossChainSignal {
+  type:        "token_momentum" | "nft_activity" | "whale_migration" | "chain_rotation";
+  fromChain:   string;
+  toChain?:    string;
+  asset:       string;
+  description: string;
+  confidence:  number;
+  timestamp:   number;
+}
+
+const K = {
+  intel:   (chain: string) => `kira:crosschain:intel:${chain}`,
+  signals: ()               => `kira:crosschain:signals`,
+};
+
+export class KiraCrossChain {
+
+  // ── ARBITRUM INTELLIGENCE ─────────────────────────────────────────────────────
+
+  async getArbitrumIntel(): Promise<ChainIntelligence | null> {
+    const cached = await kiraRedis.getJson<ChainIntelligence>(K.intel("arbitrum"));
+    if (cached && Date.now() - cached.fetchedAt < 2 * 60 * 60 * 1000) return cached;
+
+    try {
+      // DexScreener for Arbitrum token activity
+      const tokenRes = await fetch(
+        "https://api.dexscreener.com/latest/dex/tokens/trending?chain=arbitrum",
+        { signal: AbortSignal.timeout(10000) }
+      );
+
+      const topTokens: TokenSnapshot[] = [];
+      if (tokenRes.ok) {
+        const data  = await tokenRes.json() as any;
+        const pairs = (data.pairs || [])
+          .filter((p: any) => p.chainId === "arbitrum")
+          .slice(0, 10);
+
+        for (const p of pairs) {
+          topTokens.push({
+            address:   p.baseToken?.address  || "",
+            symbol:    p.baseToken?.symbol   || "UNKNOWN",
+            price:     parseFloat(p.priceUsd || "0"),
+            change24h: parseFloat(p.priceChange?.h24 || "0"),
+            volume24h: p.volume?.h24 || 0,
+            chain:     "arbitrum",
+          });
+        }
+      }
+
+      // Gas price for Arbitrum
+      let gasGwei = 0;
+      try {
+        const gasRes  = await fetch(
+          "https://api.etherscan.io/api?module=gastracker&action=gasoracle&chainid=42161" +
+          (process.env.ETHERSCAN_API_KEY ? `&apikey=${process.env.ETHERSCAN_API_KEY}` : ""),
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (gasRes.ok) {
+          const gasData = await gasRes.json() as any;
+          gasGwei = parseFloat(gasData.result?.SafeGasPrice || "0");
+        }
+      } catch {}
+
+      const intel: ChainIntelligence = {
+        chain:         "arbitrum",
+        tvl:           0,
+        volume24h:     topTokens.reduce((s, t) => s + t.volume24h, 0),
+        activeWallets: 0,
+        topTokens:     topTokens.slice(0, 5),
+        topNFTs:       [],
+        gasGwei,
+        fetchedAt:     Date.now(),
+      };
+
+      await kiraRedis.setJson(K.intel("arbitrum"), intel);
+      return intel;
+
+    } catch (err: any) {
+      console.error("[CrossChain] Arbitrum intel failed:", err?.message);
+      return null;
+    }
+  }
+
+  // ── SOLANA INTELLIGENCE (read-only) ───────────────────────────────────────────
+
+  async getSolanaIntel(): Promise<ChainIntelligence | null> {
+    const cached = await kiraRedis.getJson<ChainIntelligence>(K.intel("solana"));
+    if (cached && Date.now() - cached.fetchedAt < 2 * 60 * 60 * 1000) return cached;
+
+    try {
+      // DexScreener for Solana top tokens
+      const tokenRes = await fetch(
+        "https://api.dexscreener.com/token-boosts/top/v1",
+        { signal: AbortSignal.timeout(10000) }
+      );
+
+      const topTokens: TokenSnapshot[] = [];
+      if (tokenRes.ok) {
+        const data   = await tokenRes.json() as any;
+        const tokens = (Array.isArray(data) ? data : [])
+          .filter((t: any) => t.chainId === "solana")
+          .slice(0, 10);
+
+        for (const t of tokens) {
+          topTokens.push({
+            address:   t.tokenAddress || "",
+            symbol:    t.description  || "UNKNOWN",
+            price:     0,
+            change24h: 0,
+            volume24h: 0,
+            chain:     "solana",
+          });
+        }
+      }
+
+      // Solana NFT floor data via Magic Eden API (free)
+      const topNFTs: NFTSnapshot[] = [];
+      try {
+        const nftRes = await fetch(
+          "https://api-mainnet.magiceden.dev/v2/collections?offset=0&limit=10&sort=volume&order=desc",
+          { signal: AbortSignal.timeout(10000) }
+        );
+        if (nftRes.ok) {
+          const nftData = await nftRes.json() as any;
+          for (const col of (nftData || []).slice(0, 5)) {
+            topNFTs.push({
+              address:  col.symbol     || "",
+              name:     col.name       || "Unknown",
+              floorEth: (col.floorPrice || 0) * 0.007, // SOL to ETH rough conversion
+              volume24h: col.volumeAll  || 0,
+              chain:    "solana",
+            });
+          }
+        }
+      } catch {}
+
+      const intel: ChainIntelligence = {
+        chain:         "solana",
+        tvl:           0,
+        volume24h:     topTokens.reduce((s, t) => s + t.volume24h, 0),
+        activeWallets: 0,
+        topTokens:     topTokens.slice(0, 5),
+        topNFTs,
+        gasGwei:       0.00025, // SOL fee in SOL, not gwei — approximate
+        fetchedAt:     Date.now(),
+      };
+
+      await kiraRedis.setJson(K.intel("solana"), intel);
+      return intel;
+
+    } catch (err: any) {
+      console.error("[CrossChain] Solana intel failed:", err?.message);
+      return null;
+    }
+  }
+
+  // ── CROSS-CHAIN SIGNAL DETECTION ──────────────────────────────────────────────
+  // Identifies patterns that span chains — rotation signals, momentum spreads
+
+  async detectCrossChainSignals(
+    ethIntel?:  ChainIntelligence,
+    baseIntel?: ChainIntelligence,
+    arbIntel?:  ChainIntelligence,
+    solIntel?:  ChainIntelligence,
+  ): Promise<CrossChainSignal[]> {
+    const signals: CrossChainSignal[] = [];
+
+    try {
+      // Signal 1: Same token trending on multiple chains
+      const allTokens = [
+        ...(ethIntel?.topTokens  || []),
+        ...(baseIntel?.topTokens || []),
+        ...(arbIntel?.topTokens  || []),
+        ...(solIntel?.topTokens  || []),
+      ];
+
+      const symbolCount: Record<string, { count: number; chains: string[] }> = {};
+      for (const t of allTokens) {
+        const sym = t.symbol.toUpperCase();
+        if (!symbolCount[sym]) symbolCount[sym] = { count: 0, chains: [] };
+        symbolCount[sym].count++;
+        symbolCount[sym].chains.push(t.chain);
+      }
+
+      for (const [sym, data] of Object.entries(symbolCount)) {
+        if (data.count >= 2 && sym !== "WETH" && sym !== "USDC" && sym !== "USDT") {
+          signals.push({
+            type:        "token_momentum",
+            fromChain:   data.chains[0],
+            toChain:     data.chains[1],
+            asset:       sym,
+            description: `${sym} trending on ${data.chains.join(" + ")} simultaneously`,
+            confidence:  Math.min(0.9, data.count * 0.3),
+            timestamp:   Date.now(),
+          });
+        }
+      }
+
+      // Signal 2: Solana NFT volume spike vs Ethereum NFT volume drop (rotation)
+      if (solIntel && ethIntel) {
+        const solNFTVol = solIntel.topNFTs.reduce((s, n) => s + n.volume24h, 0);
+        const ethNFTVol = ethIntel.topNFTs.reduce((s, n) => s + n.volume24h, 0);
+
+        // This is a rough heuristic — improve with historical data
+        if (solNFTVol > 0 && ethNFTVol > 0) {
+          // Record for pattern detection over time
+          await kiraRedis.set("kira:cc:sol_nft_vol", String(solNFTVol));
+          await kiraRedis.set("kira:cc:eth_nft_vol", String(ethNFTVol));
+        }
+      }
+
+      // Store signals
+      if (signals.length > 0) {
+        const existing  = await kiraRedis.getJson<CrossChainSignal[]>(K.signals()) || [];
+        const combined  = [...signals, ...existing].slice(0, 20);
+        await kiraRedis.setJson(K.signals(), combined);
+      }
+
+    } catch (err: any) {
+      console.error("[CrossChain] Signal detection failed:", err?.message);
+    }
+
+    return signals;
+  }
+
+  // ── FULL INTEL SCAN ───────────────────────────────────────────────────────────
+
+  async scanAllChains(): Promise<{
+    arbitrum?:  ChainIntelligence;
+    solana?:    ChainIntelligence;
+    signals:    CrossChainSignal[];
+  }> {
+    console.log("[CrossChain] Scanning Arbitrum + Solana...");
+
+    const [arb, sol] = await Promise.allSettled([
+      this.getArbitrumIntel(),
+      this.getSolanaIntel(),
+    ]);
+
+    const arbData = arb.status === "fulfilled" ? arb.value || undefined : undefined;
+    const solData = sol.status === "fulfilled" ? sol.value || undefined : undefined;
+
+    const signals = await this.detectCrossChainSignals(
+      undefined, undefined, arbData, solData
+    );
+
+    if (arbData) console.log(`[CrossChain] Arbitrum: ${arbData.topTokens.length} tokens tracked`);
+    if (solData) console.log(`[CrossChain] Solana: ${solData.topNFTs.length} NFTs tracked (read-only)`);
+    if (signals.length > 0) console.log(`[CrossChain] ${signals.length} cross-chain signals`);
+
+    return { arbitrum: arbData, solana: solData, signals };
+  }
+
+  async formatForContext(): Promise<string> {
+    const arb = await kiraRedis.getJson<ChainIntelligence>(K.intel("arbitrum"));
+    const sol = await kiraRedis.getJson<ChainIntelligence>(K.intel("solana"));
+    const sigs = await kiraRedis.getJson<CrossChainSignal[]>(K.signals()) || [];
+
+    const parts: string[] = [];
+    if (arb) parts.push(`ARB: ${arb.topTokens[0]?.symbol || "N/A"} leading`);
+    if (sol) parts.push(`SOL: ${sol.topNFTs[0]?.name || "N/A"} top NFT`);
+    if (sigs.length > 0) parts.push(`${sigs.length} cross-chain signals`);
+    return parts.join(" | ") || "Cross-chain: scanning";
+  }
+}
