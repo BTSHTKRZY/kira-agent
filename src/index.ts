@@ -1042,7 +1042,7 @@ type Action =
   | "post" | "post_thread" | "reply_mentions" | "check_wallet"
   | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade"
   | "review_watchlist" | "observe" | "sleep"
-  | "engage_community" | "follow_accounts" | "engage_topics";
+  | "engage_community" | "follow_accounts" | "engage_topics" | "research_now";
 
 interface Decision {
   action:     Action;
@@ -1128,7 +1128,7 @@ AVAILABLE ACTIONS:
 - reply_mentions: check and reply to X mentions
 - engage_community: like/reply to priority accounts (normiesart, CodinCowboy, AxiomBot etc)
 - follow_accounts: follow back mentioners
-- engage_topics: search and engage dynamically with relevant crypto/NFT/agent discussions
+- engage_topics: actively search the timeline for agent/tool/ERC-standard developments, new tool deployments, and infra discussions — then engage substantively: reply with analysis, ask the deployer questions, react to what works/doesn't. This is how KIRA participates like a peer, not a broadcaster.
 - check_wallet: verify a known wallet
 - read_docs: read ERC-8257 or AgentCheck docs
 - scan_tools: scan ERC-8257 registry
@@ -1145,7 +1145,7 @@ RULES:
 - Min since last engagement: ${minutesSinceEngagement} (need 60+)
 - Min since last mention check: ${minutesSinceMention}
 - ${minutesSinceLastPost < 15 ? "TOO SOON TO POST" : ""}
-- ${state.postCount >= 5 ? "DAILY LIMIT — choose: reply_mentions (if >30min since last) → engage_community (if >60min) → engage_topics (if >90min) → sleep" : ""}
+- ${state.postCount >= 5 ? "POST LIMIT REACHED — do NOT idle. Engage the timeline and learn: reply_mentions → engage_topics (find & discuss agent/tool/ERC developments, ask questions, react to deployments) → engage_community → research_now (background learning). Engagement keeps KIRA present like other active agents." : ""}
 - ${state.hasPostedFirst ? "DO NOT re-introduce yourself. DO NOT say 'awakening' as introduction." : "Make your introduction post."}
 - Market scan: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
 - Cross-chain: ${state.crossChainSummary || "not yet scanned"}
@@ -1174,15 +1174,24 @@ Respond ONLY with valid JSON:
     if (!state.xApiAvailable && ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics"].includes(parsed.action))
       return { action: "sleep", content: "15", reasoning: "X API unavailable" };
 
-    // Post limit rotation — prevents reply_mentions loop
+    // Post limit rotation — when capped on posting, KIRA shifts to ENGAGEMENT and
+    // RESEARCH rather than idling. Ladder ordered high-to-low so each rung is reachable.
+    // Engagement with the timeline (replies, topic discovery, community) is how KIRA
+    // stays present like other active agents — capped posting must NOT mean silence.
     if (state.postCount >= 5 && (parsed.action === "post" || parsed.action === "post_thread")) {
+      // 1. Check mentions first (most relevant — someone spoke to KIRA)
       if (minutesSinceMention >= 30)
         return { action: "reply_mentions", content: "Checking mentions", reasoning: "Post limit — checking mentions" };
-      if (minutesSinceEngagement >= 60)
+      // 2. Engage dynamically with relevant agent/tool/ERC discussions on the timeline
+      //    (this is the dead-code path before — now reachable; ~40min cadence)
+      if (minutesSinceEngagement >= 40)
+        return { action: "engage_topics", content: "Engaging topics", reasoning: "Post limit — engaging frontier topics" };
+      // 3. Engage priority accounts (lighter cadence)
+      if (minutesSinceEngagement >= 25)
         return { action: "engage_community", content: "Engaging community", reasoning: "Post limit — engaging community" };
-      if (minutesSinceEngagement >= 90)
-        return { action: "engage_topics", content: "Engaging topics", reasoning: "Post limit — engaging topics" };
-      return { action: "sleep", content: "20", reasoning: "Post limit — all engagement on cooldown" };
+      // 4. Instead of sleeping, do background research/learning if anything is due.
+      //    Capped time is the BEST time to learn — never waste it idling.
+      return { action: "research_now", content: "Background research", reasoning: "Post limit — using idle time to learn" };
     }
 
     if (parsed.action === "post" || parsed.action === "post_thread") {
@@ -1218,8 +1227,8 @@ Respond ONLY with valid JSON:
       }
     }
 
-    if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 60)
-      return { action: "sleep", content: "20", reasoning: "Engagement cooldown" };
+    if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 25)
+      return { action: "research_now", content: "Background research", reasoning: "Engagement cooldown — learning instead" };
 
     if (parsed.action === "reply_mentions") {
       // Hard cooldown — if mentions checked within last 30 min, sleep instead of looping
@@ -1387,6 +1396,45 @@ async function execute(decision: Decision): Promise<void> {
         const wlStr = wl.length > 0 ? wl.slice(0, 5).map(w => `${w.name}: ${w.lastScore}/100`).join(", ") : "empty";
         state.recentLearnings.push(`Watchlist (${wl.length}): ${wlStr}`);
         await sleep(2 * 60 * 1000);
+        break;
+
+      case "research_now":
+        // Capped on posting/engagement — use the time to LEARN, not idle.
+        try {
+          // Always refresh macro/market research (cheap, keeps context live)
+          await runResearchCycle();
+          // Run the autonomous research loop if due (scout X+web, distill, learn,
+          // queue frontier posts, email build-recs). This is the centerpiece working
+          // in KIRA's idle windows instead of sleeping.
+          if (await researchLoop.isDue()) {
+            const result = await researchLoop.runCycle({
+              webSearch: async (query: string) => {
+                const tweets = await twitter.searchTweets(query, 8);
+                return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
+              },
+              webFetch: async (url: string) => { try { return await docs.readArbitraryUrl(url); } catch { return ""; } },
+              xSearch: async (query: string) => {
+                const tweets = await twitter.searchTweets(query, 8);
+                return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
+              },
+              xLinks: async (query: string) => {
+                const tweets = await twitter.searchTweets(query, 10);
+                return twitter.extractUrls(tweets);
+              },
+              signalAccounts: () => ["CodinCowboy","AxiomBot","serc1n","YigitDuman","OnchainDataNerd","lookonchain","DefiIgnas","punk6529","0xAlexKorn"],
+              learningTerms: async () => {
+                const learnings = await memory.getCoreLearnings(6);
+                return learnings.map(l => (l.insight || "").split(/\s+/).slice(0, 5).join(" ")).filter(t => t.length > 8);
+              },
+            });
+            state.researchSummary  = await researchLoop.formatForContext();
+            state.lastResearchLoop = Date.now();
+            if (result.summary) { state.recentLearnings.push(`Research: ${result.summary}`); console.log(`[Research] (idle-time) ${result.summary}`); }
+          } else {
+            console.log("[Research] Not due yet — refreshed macro only");
+          }
+        } catch (err: any) { console.error("research_now error:", err?.message); }
+        await sleep(10 * 60 * 1000);
         break;
 
       case "observe":
