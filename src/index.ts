@@ -900,6 +900,24 @@ async function backgroundTasks(): Promise<void> {
           const tweets = await twitter.searchTweets(query, 8);
           return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
         },
+        // Real external links shared in tweets — KIRA reads the actual articles/repos.
+        xLinks: async (query: string) => {
+          const tweets = await twitter.searchTweets(query, 10);
+          return twitter.extractUrls(tweets);
+        },
+        // High-signal accounts KIRA follows (frontier agent/infra voices).
+        signalAccounts: () => [
+          "CodinCowboy", "AxiomBot", "serc1n", "YigitDuman", "OnchainDataNerd",
+          "lookonchain", "DefiIgnas", "punk6529", "0xAlexKorn",
+        ],
+        // Mine recent learnings for follow-up search terms KIRA already cares about.
+        learningTerms: async () => {
+          const learnings = await memory.getCoreLearnings(6);
+          // Use each learning's short insight as a search seed (first ~5 words)
+          return learnings
+            .map(l => (l.insight || "").split(/\s+/).slice(0, 5).join(" "))
+            .filter(t => t.length > 8);
+        },
       });
       state.researchSummary  = await researchLoop.formatForContext();
       state.lastResearchLoop = now;
