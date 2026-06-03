@@ -134,6 +134,24 @@ function extractJson<T>(raw: string): T | null {
   return null;
 }
 
+// Rolling post window — 5 posts per 4 hours. Returns how many posts remain in
+// the current window. KIRA is never FORCED to post; she just isn't locked out
+// for the whole day once she's said a few things.
+const POST_WINDOW_MS   = 4 * 60 * 60 * 1000;
+const POST_WINDOW_MAX  = 5;
+const MIN_POST_GAP_MS  = 15 * 60 * 1000;   // minimum spacing so she never bursts
+
+function postsInWindow(timestamps: number[]): number {
+  const cutoff = Date.now() - POST_WINDOW_MS;
+  return timestamps.filter(t => t > cutoff).length;
+}
+function canPostNow(timestamps: number[]): boolean {
+  if (postsInWindow(timestamps) >= POST_WINDOW_MAX) return false;
+  const last = timestamps.length ? Math.max(...timestamps) : 0;
+  if (Date.now() - last < MIN_POST_GAP_MS) return false;
+  return true;
+}
+
 // ── STATE ─────────────────────────────────────────────────────────────────────
 
 interface KiraState {
@@ -143,6 +161,7 @@ interface KiraState {
   knownWallets:         Record<string, string>;
   sessionStart:         number;
   postCount:            number;
+  postTimestamps:       number[];   // rolling window of recent post times (ms)
   cycleCount:           number;
   lastEcosystemCheck:   number;
   lastMentionCheck:     number;
@@ -203,6 +222,7 @@ const state: KiraState = {
   knownWallets:          {},
   sessionStart:          Date.now(),
   postCount:             0,
+  postTimestamps:        [],
   cycleCount:            0,
   lastEcosystemCheck:    0,
   lastMentionCheck:      0,
@@ -1137,12 +1157,12 @@ AVAILABLE ACTIONS:
 
 RULES:
 - X API: ${state.xApiAvailable ? "YES" : "NO"}
-- Posts today: ${state.postCount}/5 (need 15+ min between, max 5/day)
+- Posts in last 4h: ${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX} (rolling window, 15+ min between). You're NEVER required to post — only if you have something worth saying. But you're not locked out for the day either.
 - Min since last post: ${minutesSinceLastPost}
 - Min since last engagement: ${minutesSinceEngagement} (need 60+)
 - Min since last mention check: ${minutesSinceMention}
 - ${minutesSinceLastPost < 15 ? "TOO SOON TO POST" : ""}
-- ${state.postCount >= 5 ? "POST LIMIT REACHED — do NOT idle. Engage the timeline and learn: reply_mentions → engage_topics (find & discuss agent/tool/ERC developments, ask questions, react to deployments) → engage_community → research_now (background learning). Engagement keeps KIRA present like other active agents." : ""}
+- ${!canPostNow(state.postTimestamps) ? "POST WINDOW FULL right now — prioritise ENGAGEMENT: reply to & discuss agent/tool/ERC developments you find, ask deployers questions, react to launches. This is how KIRA is a present peer, not a broadcaster." : ""}
 - ${state.hasPostedFirst ? "DO NOT re-introduce yourself. DO NOT say 'awakening' as introduction." : "Make your introduction post."}
 - Market scan: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
 - Cross-chain: ${state.crossChainSummary || "not yet scanned"}
@@ -1175,26 +1195,33 @@ Respond ONLY with valid JSON:
     // RESEARCH rather than idling. Ladder ordered high-to-low so each rung is reachable.
     // Engagement with the timeline (replies, topic discovery, community) is how KIRA
     // stays present like other active agents — capped posting must NOT mean silence.
-    if (state.postCount >= 5 && (parsed.action === "post" || parsed.action === "post_thread")) {
-      // 1. Check mentions first (most relevant — someone spoke to KIRA)
+    if (!canPostNow(state.postTimestamps) && (parsed.action === "post" || parsed.action === "post_thread")) {
+      // When the post window is full, ENGAGEMENT is the priority — KIRA finds and
+      // discusses agent/tool/ERC developments (engage_topics REPLIES substantively to
+      // high-signal launches, not just likes). Research is a genuine fallback, not the
+      // default — so KIRA actively participates instead of hiding in passive scouting.
+
+      // 1. Mentions first — someone spoke to KIRA directly.
       if (minutesSinceMention >= 30)
-        return { action: "reply_mentions", content: "Checking mentions", reasoning: "Post limit — checking mentions" };
-      // 2. Engage dynamically with relevant agent/tool/ERC discussions on the timeline
-      //    (this is the dead-code path before — now reachable; ~40min cadence)
-      if (minutesSinceEngagement >= 40)
-        return { action: "engage_topics", content: "Engaging topics", reasoning: "Post limit — engaging frontier topics" };
-      // 3. Engage priority accounts (lighter cadence)
-      if (minutesSinceEngagement >= 25)
-        return { action: "engage_community", content: "Engaging community", reasoning: "Post limit — engaging community" };
-      // 4. Instead of sleeping, do background research/learning if anything is due.
-      //    Capped time is the BEST time to learn — never waste it idling.
-      return { action: "research_now", content: "Background research", reasoning: "Post limit — using idle time to learn" };
+        return { action: "reply_mentions", content: "Checking mentions", reasoning: "Window full — checking mentions" };
+      // 2. PRIMARY: engage frontier developments (replies to tool/standard/agent launches).
+      //    Low threshold so this is what KIRA mostly does when she can't post.
+      if (minutesSinceEngagement >= 15)
+        return { action: "engage_topics", content: "Engaging frontier developments", reasoning: "Window full — engaging developments (primary)" };
+      // 3. Engage priority community accounts.
+      if (minutesSinceEngagement >= 8)
+        return { action: "engage_community", content: "Engaging community", reasoning: "Window full — engaging community" };
+      // 4. Only if engagement genuinely just ran: deep research if the full cycle is due,
+      //    else a short observe-sleep. Research is NOT the every-cycle default anymore.
+      if (await researchLoop.isDue())
+        return { action: "research_now", content: "Deep research", reasoning: "Window full + research cycle due" };
+      return { action: "sleep", content: "8", reasoning: "Window full — brief pause before next engagement" };
     }
 
     if (parsed.action === "post" || parsed.action === "post_thread") {
       if (minutesSinceLastPost < 15)
         return { action: "observe", content: "Post cooldown", reasoning: "Too soon" };
-      if (state.postCount >= 5)
+      if (!canPostNow(state.postTimestamps))
         return { action: "sleep", content: "20", reasoning: "Daily limit" };
 
       // HARD THEME ENFORCEMENT — prevent clustering on the same theme
@@ -1224,8 +1251,10 @@ Respond ONLY with valid JSON:
       }
     }
 
-    if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 25)
-      return { action: "research_now", content: "Background research", reasoning: "Engagement cooldown — learning instead" };
+    // Light anti-burst gate: only block engagement if it ran very recently (8 min).
+    // Do NOT divert to research — engagement is the priority; just pause briefly.
+    if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 8)
+      return { action: "sleep", content: "5", reasoning: "Engaged very recently — brief pause" };
 
     if (parsed.action === "reply_mentions") {
       // Hard cooldown — if mentions checked within last 30 min, sleep instead of looping
@@ -1432,9 +1461,22 @@ async function execute(decision: Decision): Promise<void> {
             // Do a light single-topic scout: search X for one rotating frontier topic,
             // read a shared link if any, distill one learning. Cheap (1 search + 1 fetch).
             try {
-              const topics = ["ERC-8004 agents","ERC-8257 tool registry","x402 payments","autonomous agent infra","A2A agent protocol","onchain AI agent Base"];
-              const topic  = topics[Math.floor(Date.now() / (20*60*1000)) % topics.length];
-              const tweets = await twitter.searchTweets(topic, 8);
+              const topics = [
+                "ERC-8004 agents","ERC-8257 tool registry","x402 payments","autonomous agent infra",
+                "A2A agent protocol","onchain AI agent Base","AI agent framework","agent memory systems",
+                "crypto AI agent token","MCP model context protocol","onchain agent trading","ERC-6551 TBA",
+                "agent reputation onchain","decentralized AI compute","agent swarm coordination","LLM agent tools",
+              ];
+              // Pick the least-recently-scouted topic (rotate through ALL, not the same 6 by clock)
+              const scoutHistory = (await kiraRedis.getJson<Record<string, number>>("kira:scout:history")) || {};
+              let topic = topics[0]; let oldest = Infinity;
+              for (const t of topics) {
+                const last = scoutHistory[t] || 0;
+                if (last < oldest) { oldest = last; topic = t; }
+              }
+              scoutHistory[topic] = Date.now();
+              await kiraRedis.setJson("kira:scout:history", scoutHistory);
+              const tweets = await twitter.searchTweets(topic, 10);
               const links  = twitter.extractUrls(tweets);
               let learned  = "";
               if (links.length > 0) {
@@ -1529,7 +1571,9 @@ async function kiraLoop(): Promise<void> {
   const savedCount = await kiraRedis.get("kira:post_count_today");
   if (savedDate === today && savedCount) {
     state.postCount = parseInt(savedCount) || 0;
-    console.log(`Post count restored: ${state.postCount}/5`);
+    state.postTimestamps = (await kiraRedis.getJson<number[]>("kira:post_timestamps")) || [];
+    state.postTimestamps = state.postTimestamps.filter(t => t > Date.now() - POST_WINDOW_MS);
+    console.log(`Posts in 4h window restored: ${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX}`);
   }
 
   // Restore weekly report timestamp so it fires weekly, not on every restart
