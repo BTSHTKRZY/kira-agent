@@ -70,7 +70,7 @@ export class KiraA2A {
         this.account = privateKeyToAccount(pk);
         this.wallet  = createWalletClient({
           account: this.account, chain: base,
-          transport: http(process.env.BASE_RPC || "https://mainnet.base.org"),
+          transport: http(process.env.BASE_RPC || "https://base-rpc.publicnode.com"),
         });
         this.ready = true;
         console.log("[A2A] Ready — signed agent messaging enabled");
