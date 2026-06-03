@@ -70,6 +70,13 @@ export interface ResearchTools {
   webSearch:  (query: string) => Promise<Array<{ title: string; url: string; snippet: string }>>;
   webFetch:   (url: string) => Promise<string>;
   xSearch:    (query: string) => Promise<Array<{ text: string; author: string }>>;
+  // Returns real external links shared inside tweets matching a query — lets KIRA
+  // read the actual articles/repos people cite, not just tweet text.
+  xLinks?:    (query: string) => Promise<string[]>;
+  // High-signal accounts KIRA should scout directly (drawn from her follows).
+  signalAccounts?: () => string[];
+  // Recent learnings KIRA can mine for follow-up search terms.
+  learningTerms?: () => Promise<string[]>;
 }
 
 export class KiraResearchLoop {
@@ -100,8 +107,14 @@ export class KiraResearchLoop {
     let postsQueued = 0;
 
     try {
-      // STAGE 1: SCOUT — rotate through a couple of queries per cycle (cost-bounded)
-      const queries = this.pickQueries(2);
+      // STAGE 1: SCOUT — base rotation + learning-derived follow-ups (cost-bounded)
+      const baseQueries = this.pickQueries(2);
+      let followUps: string[] = [];
+      if (tools.learningTerms) {
+        try { followUps = (await tools.learningTerms()).slice(0, 1); } catch {}
+      }
+      const queries = [...baseQueries, ...followUps];
+
       const scouted: Array<{ title: string; url: string; snippet: string; query: string }> = [];
       for (const q of queries) {
         try {
@@ -110,6 +123,30 @@ export class KiraResearchLoop {
         } catch (err: any) {
           console.warn(`[Research] scout failed for "${q}": ${err?.message}`);
         }
+        // Pull real external links shared in tweets for this query (articles/repos)
+        if (tools.xLinks) {
+          try {
+            const links = await tools.xLinks(q);
+            for (const url of links.slice(0, 3)) {
+              scouted.push({ title: url, url, snippet: `Shared on X re: ${q}`, query: q });
+            }
+          } catch {}
+        }
+      }
+
+      // Scout ONE rotating high-signal account's shared links per cycle (deep-not-wide).
+      if (tools.signalAccounts && tools.xLinks) {
+        try {
+          const accounts = tools.signalAccounts();
+          if (accounts.length > 0) {
+            const idx = Math.floor(Date.now() / CYCLE_INTERVAL_MS) % accounts.length;
+            const handle = accounts[idx];
+            const links = await tools.xLinks(`from:${handle}`);
+            for (const url of links.slice(0, 3)) {
+              scouted.push({ title: url, url, snippet: `Shared by @${handle}`, query: `from:${handle}` });
+            }
+          }
+        } catch {}
       }
 
       // Filter out sources already seen
