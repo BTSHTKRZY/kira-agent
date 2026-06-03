@@ -375,7 +375,7 @@ async function monitorPositions(): Promise<void> {
             : reason === "stop_loss"
             ? `Cut ${position.name}. ${pnlPct.toFixed(1)}% paper loss. Updating the model.`
             : `Time stop: ${position.name} after ${Math.floor((Date.now() - position.openedAt) / 86400000)}d. ${pnlPct.toFixed(1)}%.`;
-          if (tweet.length <= 280) await twitter.post(tweet);
+          await twitter.post(tweet);
         }
       } else if (position.mode === "live" && state.liveMode) {
         let sellResult;
@@ -719,10 +719,8 @@ async function executePaperTrade(): Promise<void> {
 
     if (state.xApiAvailable) {
       const tweet = `Watching ${candidate.name}. ${candidate.thesis.slice(0, 180)} [paper]`;
-      if (tweet.length <= 280) {
-        await twitter.post(tweet);
-        state.recentPostTopics.push("paper_trade");
-      }
+      await twitter.post(tweet);
+      state.recentPostTopics.push("paper_trade");
     }
   } catch (err: any) { console.error("Paper trade error:", err?.message); }
 }
@@ -1292,19 +1290,22 @@ async function execute(decision: Decision): Promise<void> {
 
       case "post":
         if (!state.xApiAvailable || !decision.content) { await sleep(5 * 60 * 1000); break; }
-        if (decision.content.length <= 280) {
+        {
+          // No 280 gate — KIRA is verified; post() trims only as a high safety net.
           const posted = await twitter.post(decision.content);
           if (posted) {
             state.recentPosts.push(`[${new Date().toISOString()}] ${decision.content}`);
             if (state.recentPosts.length > 100) state.recentPosts.shift();
             state.postCount++;
             state.lastPostTime = Date.now();
-            // Track the explicit theme to enforce rotation
+            // Rolling-window record
+            state.postTimestamps.push(Date.now());
+            state.postTimestamps = state.postTimestamps.filter(t => t > Date.now() - POST_WINDOW_MS);
+            await kiraRedis.setJson("kira:post_timestamps", state.postTimestamps);
             const theme = decision.theme || "unspecified";
             state.recentPostTopics.push(theme);
             if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
             await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
-            // If this post drew on frontier research, consume one queued finding
             if (theme === "agent_ecosystem" || theme === "tool_intelligence") {
               await researchLoop.getQueuedPost();
               await memory.journal("interaction", `Posted frontier intelligence (${theme})`);
@@ -1313,9 +1314,8 @@ async function execute(decision: Decision): Promise<void> {
               state.hasPostedFirst = true;
               await kiraRedis.set("kira:has_posted_first", "true");
             }
-            await kiraRedis.set("kira:post_count_date",  new Date().toDateString());
             await kiraRedis.set("kira:post_count_today", String(state.postCount));
-            console.log(`✓ Posted (${state.postCount}/5 today)`);
+            console.log(`✓ Posted (${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX} in 4h window)`);
           }
         }
         await sleep(15 * 60 * 1000);
@@ -1332,6 +1332,9 @@ async function execute(decision: Decision): Promise<void> {
             state.recentPosts.push(`[${new Date().toISOString()}] THREAD: ${threadTweets[0].slice(0, 80)}`);
             state.postCount++;
             state.lastPostTime = Date.now();
+            state.postTimestamps.push(Date.now());
+            state.postTimestamps = state.postTimestamps.filter(t => t > Date.now() - POST_WINDOW_MS);
+            await kiraRedis.setJson("kira:post_timestamps", state.postTimestamps);
             const theme = decision.theme || "thread";
             state.recentPostTopics.push(theme);
             if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
