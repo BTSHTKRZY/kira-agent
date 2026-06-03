@@ -1509,7 +1509,7 @@ async function kiraLoop(): Promise<void> {
   state.proposalSummary     = await proposals.formatSummaryForContext();
   state.floorHistorySummary = await floorHistory.getSummaryForContext();
   state.smartMoneySummary   = await smartMoney.formatSummaryForContext();
-  state.multiAgentSummary   = await multiAgent.formatForContext();
+  state.multiAgentSummary   = `${await agentNetwork.formatForContext()} | legacy: ${await multiAgent.formatForContext()}`;
   state.toolDeploymentSummary = await toolDeployment.formatForContext();
 
   console.log(`Proposals: ${state.proposalSummary}`);
