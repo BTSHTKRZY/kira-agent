@@ -463,20 +463,17 @@ async function scanMarketsForOpportunities(): Promise<void> {
   }
 
   // Token scan
-  const seedTokens = [
-    { address: "0x6982508145454ce325ddbe47a25d4ec3d2311933", chain: "ethereum" },
-    { address: "0x576e2bed8f7b46d34016198911cdf9886f78bea7", chain: "ethereum" },
-    { address: "0x95ad61b0a150d79219dcf64e1e6cc01f0b64c4ce", chain: "ethereum" },
-    { address: "0x514910771af9ca656af840dff83e8264ecf986ca", chain: "ethereum" },
-    { address: "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984", chain: "ethereum" },
-    { address: "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9", chain: "ethereum" },
-    { address: "0xc00e94cb662c3520282e6f5717214004a7f26888", chain: "ethereum" },
-    { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", chain: "ethereum" },
-    { address: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", chain: "base"     },
-    { address: "0x532f27101965dd16442e59d40670faf5ebb142e4", chain: "base"     },
-    { address: "0x0578d8a44db98b23bf096a382e016e29a5ce0ffe", chain: "base"     },
-    { address: "0xac1bd2486aaf3b5c0fc3fd868558b082a531b2b4", chain: "base"     },
+  // A few anchor tokens (majors KIRA always tracks for macro reference) PLUS
+  // dynamically-discovered trending tokens, so each scan covers FRESH names and
+  // KIRA actually learns from new data instead of re-scoring the same 12 forever.
+  const anchorTokens = [
+    { address: "0x6982508145454ce325ddbe47a25d4ec3d2311933", chain: "ethereum" }, // PEPE
+    { address: "0x514910771af9ca656af840dff83e8264ecf986ca", chain: "ethereum" }, // LINK
+    { address: "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599", chain: "ethereum" }, // WBTC
+    { address: "0x4ed4e862860bed51a9570b96d89af5e1b0efefed", chain: "base"     }, // DEGEN
   ];
+  const trendingTokens = await prices.getTrendingTokens(10);
+  const seedTokens = [...anchorTokens, ...trendingTokens];
 
   const seen    = new Set<string>();
   const deduped = seedTokens.filter(t => {
@@ -1431,7 +1428,32 @@ async function execute(decision: Decision): Promise<void> {
             state.lastResearchLoop = Date.now();
             if (result.summary) { state.recentLearnings.push(`Research: ${result.summary}`); console.log(`[Research] (idle-time) ${result.summary}`); }
           } else {
-            console.log("[Research] Not due yet — refreshed macro only");
+            // Full 6h cycle not due — but idle time should STILL be productive.
+            // Do a light single-topic scout: search X for one rotating frontier topic,
+            // read a shared link if any, distill one learning. Cheap (1 search + 1 fetch).
+            try {
+              const topics = ["ERC-8004 agents","ERC-8257 tool registry","x402 payments","autonomous agent infra","A2A agent protocol","onchain AI agent Base"];
+              const topic  = topics[Math.floor(Date.now() / (20*60*1000)) % topics.length];
+              const tweets = await twitter.searchTweets(topic, 8);
+              const links  = twitter.extractUrls(tweets);
+              let learned  = "";
+              if (links.length > 0) {
+                const text = await docs.readArbitraryUrl(links[0]).catch(() => "");
+                if (text && text.length > 200) {
+                  learned = `Scouted "${topic}": ${text.slice(0, 180).replace(/\s+/g, " ")}`;
+                }
+              }
+              if (!learned && tweets.length > 0) {
+                learned = `Scouted "${topic}" on X: ${tweets.length} recent discussions`;
+              }
+              if (learned) {
+                state.recentLearnings.push(learned);
+                await memory.addCoreLearning(`Frontier scout: ${topic}`, learned, 0.45);
+                console.log(`[Research] (light scout) ${topic} — ${links.length} links, ${tweets.length} posts`);
+              } else {
+                console.log(`[Research] (light scout) ${topic} — nothing notable`);
+              }
+            } catch (e: any) { console.log(`[Research] light scout skipped: ${(e?.message||"").slice(0,60)}`); }
           }
         } catch (err: any) { console.error("research_now error:", err?.message); }
         await sleep(10 * 60 * 1000);
