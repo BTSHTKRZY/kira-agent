@@ -28,6 +28,10 @@ import { startDashboard, updateDashboard } from "./dashboard.js";
 import { startToolDataServer } from "./tooldata.js";
 import { KiraMemory } from "./memory.js";
 import { KiraShadowTrading } from "./shadowtrading.js";
+import { KiraSpendLimit } from "./spendlimit.js";
+import { KiraAgentNetwork } from "./agentnetwork.js";
+import { KiraA2A } from "./a2a.js";
+import { KiraResearchLoop } from "./research_loop.js";
 import { sendEmail, weeklyReportEmail, tradeAlertEmail, alertEmail } from "./email.js";
 import { kiraRedis } from "./redis.js";
 
@@ -135,6 +139,10 @@ interface KiraState {
   coreLearnings:        string;
   relationships:        string;
   shadowSummary:        string;
+  a2aSummary:           string;
+  lastA2ACheck:         number;
+  researchSummary:      string;
+  lastResearchLoop:     number;
   xApiAvailable:        boolean;
   hasPostedFirst:       boolean;
   baseBalance:          string;
@@ -191,6 +199,10 @@ const state: KiraState = {
   coreLearnings:         "",
   relationships:         "",
   shadowSummary:         "",
+  a2aSummary:            "",
+  lastA2ACheck:          0,
+  researchSummary:       "",
+  lastResearchLoop:      0,
   xApiAvailable:         false,
   hasPostedFirst:        false,
   baseBalance:           "0",
@@ -238,6 +250,10 @@ const toolDeployment   = new KiraToolDeployment();
 const longForm         = new KiraLongForm();
 const memory           = new KiraMemory();
 const shadowTrading    = new KiraShadowTrading();
+const spendLimit       = new KiraSpendLimit();
+const agentNetwork     = new KiraAgentNetwork();
+const a2a              = new KiraA2A();
+const researchLoop     = new KiraResearchLoop(memory);
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -764,13 +780,19 @@ async function backgroundTasks(): Promise<void> {
     } catch {}
   }
 
-  // Agent discovery every 12 hours
+  // Agent discovery every 12 hours — now reads ERC-8004 identity registry for full population
   if (now - state.lastAgentDiscover > 12 * 60 * 60 * 1000) {
     try {
       await multiAgent.discoverAgents();
-      state.multiAgentSummary  = await multiAgent.formatForContext();
-      state.lastAgentDiscover  = now;
-    } catch {}
+      const newAgents = await agentNetwork.discoverFromRegistry();
+      const agentCount = await agentNetwork.getKnownAgentCount();
+      state.multiAgentSummary = `${await multiAgent.formatForContext()} | ${await agentNetwork.formatForContext()}`;
+      state.lastAgentDiscover = now;
+      if (newAgents.length > 0) {
+        state.recentLearnings.push(`ERC-8004: discovered ${newAgents.length} agents (${agentCount} total known)`);
+        await memory.journal("milestone", `Discovered ${newAgents.length} ERC-8004 agents, ${agentCount} total in network`);
+      }
+    } catch (err: any) { console.error("Agent discovery error:", err?.message); }
   }
 
   // Tool proposal every 24 hours
@@ -854,6 +876,85 @@ async function backgroundTasks(): Promise<void> {
     if (state.xApiAvailable) state.recentLearnings.push("X API unlocked");
   }
 
+  // AUTONOMOUS RESEARCH LOOP — the self-improvement centerpiece (every ~6h)
+  if (await researchLoop.isDue()) {
+    try {
+      const result = await researchLoop.runCycle({
+        // Web search: KIRA has no dedicated web-search API. Use X search as the
+        // scouting surface (rich for agent/crypto discourse) and treat tweet links
+        // as candidate sources. Returns search-result-shaped objects.
+        webSearch: async (query: string) => {
+          const tweets = await twitter.searchTweets(query, 8);
+          return tweets.map(t => ({
+            title:   (t.text || "").slice(0, 80),
+            url:     `https://x.com/i/web/status/${t.id}`,
+            snippet: t.text || "",
+          }));
+        },
+        // Web fetch: real, via the docs reader (readArbitraryUrl strips HTML).
+        webFetch: async (url: string) => {
+          try { return await docs.readArbitraryUrl(url); } catch { return ""; }
+        },
+        // X search: native.
+        xSearch: async (query: string) => {
+          const tweets = await twitter.searchTweets(query, 8);
+          return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
+        },
+      });
+      state.researchSummary  = await researchLoop.formatForContext();
+      state.lastResearchLoop = now;
+      if (result.summary) state.recentLearnings.push(`Research: ${result.summary}`);
+    } catch (err: any) { console.error("Research loop error:", err?.message); }
+  }
+
+  // A2A agent-to-agent messaging — poll inbound feed if configured, respond autonomously
+  if (a2a.isReady() && now - state.lastA2ACheck > 20 * 60 * 1000) {
+    try {
+      const inboundUrl = process.env.KIRA_A2A_INBOUND_URL || "";
+      if (inboundUrl) {
+        const res = await fetch(inboundUrl, { signal: AbortSignal.timeout(12000) });
+        if (res.ok) {
+          const data = await res.json() as any;
+          const messages = Array.isArray(data) ? data : (data.messages || []);
+          let answered = 0;
+          for (const raw of messages.slice(0, 10)) {
+            const reply = await a2a.handleInbound(raw, state.coreLearnings);
+            if (reply) {
+              answered++;
+              // Deliver reply if peer endpoint known; else it sits in outbox for relay
+              const peerEndpoint = raw.replyTo || raw.endpoint;
+              if (peerEndpoint) {
+                try {
+                  await fetch(peerEndpoint, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(reply),
+                    signal: AbortSignal.timeout(10000),
+                  });
+                } catch {}
+              }
+            }
+          }
+          if (answered > 0) {
+            state.recentLearnings.push(`A2A: answered ${answered} agent message(s)`);
+            await memory.journal("interaction", `Responded to ${answered} agent-to-agent message(s)`);
+          }
+        }
+      }
+      // Surface unhandled protocol variants as build-recommendation material
+      const unhandled = await a2a.getUnhandledVariants();
+      if (unhandled.length > 0) {
+        await memory.addCoreLearning(
+          "A2A protocol variant encountered that KIRA's code cannot parse",
+          `${unhandled.length} variant(s) seen; may need a code revision to support`,
+          0.7
+        );
+      }
+      state.a2aSummary    = await a2a.formatForContext();
+      state.lastA2ACheck  = now;
+    } catch (err: any) { console.error("A2A check error:", err?.message); }
+  }
+
   // Refresh memory-derived context summaries
   state.coreLearnings = await memory.getCoreLearningsForContext();
   state.relationships = await memory.getRelationshipsForContext();
@@ -863,7 +964,7 @@ async function backgroundTasks(): Promise<void> {
 
   // Update dashboard
   updateDashboard({
-    version:           "4.5",
+    version:           "4.6",
     uptime:            now - state.sessionStart,
     cycleCount:        state.cycleCount,
     postCount:         state.postCount,
@@ -958,6 +1059,12 @@ ${state.relationships || "none yet"}
 
 SHADOW LEARNING STATUS:
 ${state.shadowSummary || "accumulating"}
+
+FRONTIER INTELLIGENCE TO SHARE (from your autonomous research — these are genuine
+new developments you discovered; posting these is HIGH PRIORITY and uses the
+agent_ecosystem or tool_intelligence theme — it is exactly the differentiated
+content that makes your feed worth following):
+${state.researchSummary || "none queued"}
 
 RECENT LEARNINGS:
 ${state.recentLearnings.slice(-6).join("\n") || "none yet"}
@@ -1110,6 +1217,11 @@ async function execute(decision: Decision): Promise<void> {
             state.recentPostTopics.push(theme);
             if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
             await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
+            // If this post drew on frontier research, consume one queued finding
+            if (theme === "agent_ecosystem" || theme === "tool_intelligence") {
+              await researchLoop.getQueuedPost();
+              await memory.journal("interaction", `Posted frontier intelligence (${theme})`);
+            }
             if (!state.hasPostedFirst) {
               state.hasPostedFirst = true;
               await kiraRedis.set("kira:has_posted_first", "true");
@@ -1252,7 +1364,7 @@ async function execute(decision: Decision): Promise<void> {
 
 async function kiraLoop(): Promise<void> {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-  console.log("KIRA v4.5 awakening... Normie #2635 online");
+  console.log("KIRA v4.6 awakening... Normie #2635 online");
   console.log(`Wallet:  ${KIRA_WALLET}`);
   console.log(`Token:   ${KIRA_TOKEN}`);
   console.log(`Live:    ${state.liveMode ? "ENABLED" : "paper only"}`);
@@ -1273,6 +1385,11 @@ async function kiraLoop(): Promise<void> {
   await smartMoney.seedWallets();
   await smartMoney.ingestFromAgentCheck();
   await multiAgent.discoverAgents();
+  try {
+    const ownTba = await agentNetwork.resolveOwnTBA();
+    if (ownTba) console.log(`KIRA TBA (Normie #2635): ${ownTba}`);
+    await agentNetwork.discoverFromRegistry();
+  } catch (err: any) { console.error("Agent network init error:", err?.message); }
   console.log("Modules initialised");
 
   state.xApiAvailable = await twitter.init();
@@ -1400,7 +1517,9 @@ async function kiraLoop(): Promise<void> {
         `On-chain whale activity: ${state.onChainEventsSummary || "none recent"}`,
         `ERC-8257 tool ecosystem: ${state.toolDeploymentSummary} | registry: ${state.toolSummary}`,
         `Other agents: ${state.multiAgentSummary}`,
+        `Agent messaging (A2A): ${state.a2aSummary || "idle"}`,
         `Shadow learning: ${state.shadowSummary || "accumulating"}`,
+        `Autonomous research: ${state.researchSummary || "idle"}`,
         `Core learnings: ${state.coreLearnings || "none yet"}`,
         `Watchlist signals: ${state.watchlistCount} items | Paper: ${state.paperTradeCount}`,
         `Open proposals/hypotheses: ${state.proposalSummary}`,
@@ -1409,6 +1528,7 @@ async function kiraLoop(): Promise<void> {
         `Macro: ${state.macroSummary || "not fetched"}`,
         `Normies ecosystem: ${state.ecosystemSummary}`,
         `Balance: ${state.baseBalance} ETH | Aave: ${state.aaveSummary}`,
+        `${await spendLimit.formatForContext()}`,
       ].join("\n");
 
       const decision = await decide(context);
