@@ -30,11 +30,21 @@ const PRIORITY_ACCOUNTS = [
 ];
 
 const SEARCH_TOPICS = [
-  "Normies NFT", "ERC-8257", "AgentCheck", "on-chain AI agent",
-  "NFT floor dip", "crypto fear greed index", "Ethereum NFT",
-  "Base NFT", "NFT smart money", "on-chain agent deployment",
-  "NFT market recovery", "crypto whale buy", "autonomous agent crypto",
-  "NFT accumulation", "Uniswap V3 whale", "AI agent web3",
+  // Agent-infra frontier — where KIRA should be a visible peer
+  "ERC-8004 agents", "ERC-8257 tool", "x402 payment", "A2A agent protocol",
+  "autonomous AI agent", "onchain agent Base", "agent tool registry",
+  "ERC-6551 token bound account", "AI agent infrastructure", "agent deployment",
+  // Domain + Normies ecosystem
+  "Normies NFT", "AgentCheck", "NFT smart money", "NFT floor dip",
+];
+
+// High-signal phrases that mark a tweet as worth a SUBSTANTIVE reply (not just a like).
+// When a tweet matches these, KIRA should engage with analysis / a question, not skip.
+const HIGH_SIGNAL_MARKERS = [
+  "deployed", "launched", "shipped", "registered", "live on", "introducing",
+  "erc-8004", "erc-8257", "erc8004", "erc8257", "x402", "a2a", "tool registry",
+  "agent tool", "token bound", "erc-6551", "predicate", "built an agent",
+  "open source", "github.com", "just shipped", "new standard",
 ];
 
 const DM_PROPOSAL_KEYWORDS = ["APPROVE", "REJECT", "MODIFY", "ACKNOWLEDGE"];
@@ -510,7 +520,7 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
     try {
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-5", max_tokens: 200,
-        system: `Generate 3 specific X search queries for KIRA to find relevant crypto/NFT/AI agent discussions.
+        system: `Generate 3 specific X search queries to help KIRA find SUBSTANTIVE developments to engage with as a peer: new agent tool deployments, ERC-8004/8257/x402/A2A discussions, agent-infra launches, and people shipping things KIRA can react to or question. Favor queries that surface builders announcing work, not generic chatter.
 Respond ONLY with a JSON array of 3 strings.`,
         messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nGenerate 3 queries.` }],
       });
@@ -552,15 +562,18 @@ Reply in Kira's voice. Under 240 characters. Don't start with "@${authorUsername
     } catch (err: any) { console.error("generateReply failed:", err?.message); return ""; }
   }
 
-  async generateEngagementReply(tweetText: string, authorUsername: string, context: string = ""): Promise<string> {
+  async generateEngagementReply(tweetText: string, authorUsername: string, context: string = "", highSignal: boolean = false): Promise<string> {
     try {
+      const steer = highSignal
+        ? `This tweet is a real development (a tool deployment, new standard, or agent-infra update). Engage as a knowledgeable PEER: add a specific technical observation, react to what's notable about it, OR ask the author a genuine question about how it works or what's next. Be substantive — this is how KIRA earns respect in the agent ecosystem. Avoid generic praise.`
+        : `Add a genuine, specific perspective. Avoid generic filler.`;
       const response = await this.anthropic.messages.create({
-        model: "claude-sonnet-4-5", max_tokens: 150,
+        model: "claude-sonnet-4-5", max_tokens: 160,
         system: KIRA_SYSTEM_PROMPT + `
 Engaging with @${authorUsername}: "${tweetText}"
 ${context ? `\nContext: ${context}` : ""}
-Proactive engagement. Under 240 characters. Add genuine perspective.
-If nothing compelling: respond exactly SKIP`,
+${steer}
+Under 240 characters. If you have nothing genuinely worth adding: respond exactly SKIP`,
         messages: [{ role: "user", content: "Engage or SKIP?" }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "SKIP";
@@ -644,13 +657,24 @@ If nothing compelling: respond exactly SKIP`,
           if (tweet.author_id === this.myUserId) continue;
           const metrics = (tweet as any).public_metrics;
           if (!metrics || (metrics.like_count < 3 && metrics.reply_count < 1)) continue;
+
+          // Is this a substantive development (tool deploy, standard, agent infra)?
+          const lower      = (tweet.text || "").toLowerCase();
+          const highSignal = HIGH_SIGNAL_MARKERS.some(m => lower.includes(m));
+
+          // Like genuinely interesting tweets
           if (await this.shouldLike(tweet.text)) { await this.like(tweet.id); engaged++; }
-          if (Math.random() < 0.4 && !this.repliedTweets.has(tweet.id)) {
+
+          // Reply: ALWAYS attempt on high-signal developments (engage the deployer with
+          // analysis or a question); otherwise occasional (20%) to stay present without spamming.
+          const shouldReply = highSignal || Math.random() < 0.2;
+          if (shouldReply && !this.repliedTweets.has(tweet.id)) {
             const authorUsername = await this.getUsernameById(tweet.author_id || "") || "unknown";
-            const replyText      = await this.generateEngagementReply(tweet.text, authorUsername, context);
+            const replyText      = await this.generateEngagementReply(tweet.text, authorUsername, context, highSignal);
             if (replyText) {
               await this.reply(tweet.id, replyText, tweet.author_id);
               engaged++;
+              if (highSignal) console.log(`[Twitter] Engaged development by @${authorUsername}: ${tweet.text.slice(0, 60)}`);
               await new Promise(r => setTimeout(r, 3000));
             }
           }
