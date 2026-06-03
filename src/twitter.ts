@@ -450,11 +450,27 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
     try {
       const results = await this.client.v2.search(query, {
         max_results: Math.min(maxResults, 100),
-        "tweet.fields": ["author_id", "text", "created_at", "public_metrics"],
+        "tweet.fields": ["author_id", "text", "created_at", "public_metrics", "entities"],
         expansions: ["author_id"],
       });
       return results.data?.data || [];
     } catch (err: any) { console.error(`Search failed:`, err?.message); return []; }
+  }
+
+  // Extract expanded URLs shared inside a set of tweets (deduped, non-twitter links
+  // prioritised so the research loop reads actual articles/repos, not tweet permalinks).
+  extractUrls(tweets: TweetV2[]): string[] {
+    const urls = new Set<string>();
+    for (const t of tweets) {
+      const ents: any = (t as any).entities;
+      for (const u of (ents?.urls || [])) {
+        const expanded = u.expanded_url || u.url;
+        if (expanded && !expanded.includes("twitter.com") && !expanded.includes("x.com") && !expanded.includes("t.co")) {
+          urls.add(expanded);
+        }
+      }
+    }
+    return Array.from(urls);
   }
 
   // ── GET USER TWEETS ───────────────────────────────────────────────────────────
