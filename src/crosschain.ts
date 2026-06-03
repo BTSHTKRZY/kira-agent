@@ -57,29 +57,66 @@ export class KiraCrossChain {
     if (cached && Date.now() - cached.fetchedAt < 2 * 60 * 60 * 1000) return cached;
 
     try {
-      // DexScreener for Arbitrum token activity
-      const tokenRes = await fetch(
-        "https://api.dexscreener.com/latest/dex/tokens/trending?chain=arbitrum",
+      // DexScreener boosted tokens (real endpoint), filter to Arbitrum,
+      // then enrich each with live pair data via search.
+      const topTokens: TokenSnapshot[] = [];
+      const boostRes = await fetch(
+        "https://api.dexscreener.com/token-boosts/top/v1",
         { signal: AbortSignal.timeout(10000) }
       );
+      if (boostRes.ok) {
+        const boosts = await boostRes.json() as any;
+        const arbBoosts = (Array.isArray(boosts) ? boosts : [])
+          .filter((b: any) => b.chainId === "arbitrum")
+          .slice(0, 8);
 
-      const topTokens: TokenSnapshot[] = [];
-      if (tokenRes.ok) {
-        const data  = await tokenRes.json() as any;
-        const pairs = (data.pairs || [])
-          .filter((p: any) => p.chainId === "arbitrum")
-          .slice(0, 10);
-
-        for (const p of pairs) {
-          topTokens.push({
-            address:   p.baseToken?.address  || "",
-            symbol:    p.baseToken?.symbol   || "UNKNOWN",
-            price:     parseFloat(p.priceUsd || "0"),
-            change24h: parseFloat(p.priceChange?.h24 || "0"),
-            volume24h: p.volume?.h24 || 0,
-            chain:     "arbitrum",
-          });
+        for (const b of arbBoosts) {
+          // Enrich with real price/volume via the pairs-by-token endpoint
+          try {
+            const pr = await fetch(
+              `https://api.dexscreener.com/latest/dex/tokens/${b.tokenAddress}`,
+              { signal: AbortSignal.timeout(8000) }
+            );
+            if (pr.ok) {
+              const pd = await pr.json() as any;
+              const pair = (pd.pairs || []).find((p: any) => p.chainId === "arbitrum") || (pd.pairs || [])[0];
+              if (pair) {
+                topTokens.push({
+                  address:   b.tokenAddress || "",
+                  symbol:    pair.baseToken?.symbol || "UNKNOWN",
+                  price:     parseFloat(pair.priceUsd || "0"),
+                  change24h: parseFloat(pair.priceChange?.h24 || "0"),
+                  volume24h: pair.volume?.h24 || 0,
+                  chain:     "arbitrum",
+                });
+              }
+            }
+          } catch {}
+          await new Promise(r => setTimeout(r, 250));
         }
+      }
+      // Fallback: if no boosts on arbitrum, search a major arb token for activity
+      if (topTokens.length === 0) {
+        try {
+          const sr = await fetch(
+            "https://api.dexscreener.com/latest/dex/search?q=arbitrum",
+            { signal: AbortSignal.timeout(8000) }
+          );
+          if (sr.ok) {
+            const sd = await sr.json() as any;
+            const arbPairs = (sd.pairs || []).filter((p: any) => p.chainId === "arbitrum").slice(0, 5);
+            for (const pair of arbPairs) {
+              topTokens.push({
+                address:   pair.baseToken?.address || "",
+                symbol:    pair.baseToken?.symbol  || "UNKNOWN",
+                price:     parseFloat(pair.priceUsd || "0"),
+                change24h: parseFloat(pair.priceChange?.h24 || "0"),
+                volume24h: pair.volume?.h24 || 0,
+                chain:     "arbitrum",
+              });
+            }
+          }
+        } catch {}
       }
 
       // Gas price for Arbitrum
@@ -134,36 +171,52 @@ export class KiraCrossChain {
         const data   = await tokenRes.json() as any;
         const tokens = (Array.isArray(data) ? data : [])
           .filter((t: any) => t.chainId === "solana")
-          .slice(0, 10);
+          .slice(0, 6);
 
         for (const t of tokens) {
-          topTokens.push({
-            address:   t.tokenAddress || "",
-            symbol:    t.description  || "UNKNOWN",
-            price:     0,
-            change24h: 0,
-            volume24h: 0,
-            chain:     "solana",
-          });
+          // Enrich with real price/volume
+          try {
+            const pr = await fetch(
+              `https://api.dexscreener.com/latest/dex/tokens/${t.tokenAddress}`,
+              { signal: AbortSignal.timeout(8000) }
+            );
+            if (pr.ok) {
+              const pd   = await pr.json() as any;
+              const pair = (pd.pairs || []).find((p: any) => p.chainId === "solana") || (pd.pairs || [])[0];
+              topTokens.push({
+                address:   t.tokenAddress || "",
+                symbol:    pair?.baseToken?.symbol || "UNKNOWN",
+                price:     parseFloat(pair?.priceUsd || "0"),
+                change24h: parseFloat(pair?.priceChange?.h24 || "0"),
+                volume24h: pair?.volume?.h24 || 0,
+                chain:     "solana",
+              });
+            }
+          } catch {}
+          await new Promise(r => setTimeout(r, 250));
         }
       }
 
       // Solana NFT floor data via Magic Eden API (free)
       const topNFTs: NFTSnapshot[] = [];
       try {
+        // Magic Eden popular collections (valid endpoint)
         const nftRes = await fetch(
-          "https://api-mainnet.magiceden.dev/v2/collections?offset=0&limit=10&sort=volume&order=desc",
+          "https://api-mainnet.magiceden.dev/v2/marketplace/popular_collections?timeRange=1d",
           { signal: AbortSignal.timeout(10000) }
         );
         if (nftRes.ok) {
           const nftData = await nftRes.json() as any;
-          for (const col of (nftData || []).slice(0, 5)) {
+          const list = Array.isArray(nftData) ? nftData : (nftData.collections || []);
+          for (const col of list.slice(0, 5)) {
+            // floorPrice from ME is in lamports (1e9 per SOL); convert SOL→ETH approx
+            const floorSol = (col.floorPrice || 0) / 1e9;
             topNFTs.push({
-              address:  col.symbol     || "",
-              name:     col.name       || "Unknown",
-              floorEth: (col.floorPrice || 0) * 0.007, // SOL to ETH rough conversion
-              volume24h: col.volumeAll  || 0,
-              chain:    "solana",
+              address:   col.symbol      || "",
+              name:      col.name        || "Unknown",
+              floorEth:  floorSol * 0.007, // SOL→ETH rough; refined by macro later
+              volume24h: col.volume      || col.volumeAll || 0,
+              chain:     "solana",
             });
           }
         }
