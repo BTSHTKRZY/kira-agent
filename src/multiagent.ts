@@ -1,5 +1,5 @@
 // multiagent.ts — Agent-to-agent communication and coordination
-// Discovers other ERC-8257 agents, queries their tools, shares intelligence
+// Discovers other ERC-8004 agents (identity), queries their ERC-8257 tools, shares intelligence
 // KIRA as senior agent — feeds signals to other Normies agents
 
 import { kiraRedis } from "./redis.js";
@@ -8,7 +8,7 @@ export interface AgentProfile {
   address:      string;       // wallet address
   name:         string;
   tokenId?:     string;       // Normies token ID if applicable
-  tools:        string[];     // ERC-8257 tool IDs operated
+  tools:        string[];     // ERC-8257 tool IDs this agent operates (tools live on 8257)
   capabilities: string[];     // what this agent can do
   agentCheckRating?: string;
   lastSeen:     number;
@@ -64,7 +64,7 @@ const AGENTCHECK_URL = process.env.AGENTCHECK_URL || "https://agentcheck-bice.ve
 export class KiraMultiAgent {
 
   // ── AGENT DISCOVERY ───────────────────────────────────────────────────────────
-  // Finds other agents via ERC-8257 registry and AgentCheck
+  // Finds other agents via ERC-8004 identity registry, the ecosystem API, and AgentCheck
 
   async discoverAgents(): Promise<AgentProfile[]> {
     const discovered: AgentProfile[] = [];
@@ -90,7 +90,7 @@ export class KiraMultiAgent {
         }
       }
 
-      // Discover from ERC-8257 registry — agents that operate tools
+      // Discover agents that operate tools (agents = ERC-8004 identity; tools = ERC-8257)
       try {
         const res = await fetch(
           `https://normies-intelligence.vercel.app/api/handler`,
