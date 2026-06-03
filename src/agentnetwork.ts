@@ -21,8 +21,8 @@ const ERC8004_REGISTRY = process.env.ERC8004_REGISTRY || "0x8004A169FB4a3325136E
 const NORMIES_CONTRACT = process.env.NORMIES_CONTRACT || "";
 const NORMIES_API      = process.env.NORMIES_API || "https://api.normies.art";
 
-const ETH_RPC  = process.env.ETH_RPC  || "https://eth.llamarpc.com";
-const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
+const ETH_RPC  = process.env.ETH_RPC  || "https://ethereum-rpc.publicnode.com";
+const BASE_RPC = process.env.BASE_RPC || "https://base-rpc.publicnode.com";
 
 const K = {
   tba:        (chain: string, token: string, id: string) => `kira:tba:${chain}:${token.toLowerCase()}:${id}`,
@@ -146,15 +146,33 @@ export class KiraAgentNetwork {
       await kiraRedis.setJson(K.tba(chain, tokenContract, tokenId), info);
       return tbaAddress;
     } catch (err: any) {
-      console.error(`[AgentNetwork] TBA resolution failed (${tokenContract}#${tokenId}):`, err?.message);
+      // Keep this terse — RPC errors (esp. bot-challenge HTML) are huge; log one line.
+      const reason = (err?.message || "unknown").split("\n")[0].slice(0, 120);
+      console.warn(`[AgentNetwork] TBA resolve skipped (${tokenContract}#${tokenId}): ${reason}`);
       return null;
     }
   }
 
-  // KIRA's own TBA — Normie #2635
+  // KIRA's own TBA — Normie #2635. Resolved once at startup, cached 7 days.
   async resolveOwnTBA(): Promise<string | null> {
     if (!NORMIES_CONTRACT) return null;
     return this.resolveTBA(NORMIES_CONTRACT, "2635", "ethereum");
+  }
+
+  // Lazily resolve a specific agent's TBA — only call this when KIRA actually needs
+  // to know where one agent's assets live (e.g. before interacting). NOT in bulk.
+  async resolveAgentTBA(tokenId: string): Promise<string | null> {
+    if (!NORMIES_CONTRACT || !tokenId) return null;
+    const tba = await this.resolveTBA(NORMIES_CONTRACT, tokenId, "ethereum");
+    if (tba) {
+      // Backfill the stored agent record with its TBA for future use
+      const ids = await kiraRedis.smembers(K.agents8004());
+      for (const id of ids) {
+        const a = await kiraRedis.getJson<ERC8004Agent>(K.agent8004(id));
+        if (a && a.tokenId === tokenId) { a.tbaAddress = tba; await kiraRedis.setJson(K.agent8004(id), a); break; }
+      }
+    }
+    return tba;
   }
 
   // ── WALLET INVENTORY ──────────────────────────────────────────────────────────
@@ -191,7 +209,8 @@ export class KiraAgentNetwork {
       await kiraRedis.setJson(K.inventory(address), inv);
       return inv;
     } catch (err: any) {
-      console.error(`[AgentNetwork] Inventory failed (${address}):`, err?.message);
+      const reason = (err?.message || "unknown").split("\n")[0].slice(0, 120);
+      console.warn(`[AgentNetwork] Inventory skipped (${address}): ${reason}`);
       return null;
     }
   }
@@ -236,12 +255,8 @@ export class KiraAgentNetwork {
             lastSeen:     Date.now(),
           };
 
-          // Resolve the agent's TBA from the confirmed Normies ERC-721C contract
-          if (NORMIES_CONTRACT && agent.tokenId) {
-            const tba = await this.resolveTBA(NORMIES_CONTRACT, agent.tokenId, "ethereum");
-            if (tba) agent.tbaAddress = tba;
-          }
-
+          // NOTE: TBA is resolved lazily (see resolveAgentTBA), NOT here — resolving a
+          // TBA for every discovered agent floods the RPC. We only store the binding now.
           await kiraRedis.setJson(K.agent8004(agentId), agent);
           await kiraRedis.sadd(K.agents8004(), agentId);
           if (!existing) discovered.push(agent);
