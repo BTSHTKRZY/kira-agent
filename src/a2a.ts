@@ -19,9 +19,12 @@ const KIRA_PRIVATE_KEY = process.env.KIRA_PRIVATE_KEY || "";
 const KIRA_WALLET      = process.env.KIRA_WALLET      || "";
 const KIRA_AGENT_ID    = process.env.KIRA_AGENT_ID    || "32361";
 
-// Baseline A2A envelope version KIRA speaks. If a peer uses an envelope/protocol
-// KIRA doesn't recognise, that's logged as an unhandled-variant for build review.
-const A2A_BASELINE = "kira-a2a/v1";
+// KIRA speaks the canonical Agent2Agent (A2A) protocol: HTTP(S) + JSON-RPC 2.0,
+// message/send method, role+parts message structure, Agent Cards at the well-known
+// path. KIRA adds a signing layer (keccak256 + wallet signature) on top for verifiable
+// origin. If a peer uses a protocol KIRA can't parse, it's logged for build review.
+const A2A_BASELINE  = "a2a/0.3.0";          // canonical spec version KIRA targets
+const KIRA_ENVELOPE = "kira-a2a/v1";        // KIRA's signed-envelope extension tag
 
 const K = {
   inbox:     () => `kira:a2a:inbox`,
@@ -124,6 +127,90 @@ export class KiraA2A {
 
     console.log(`[A2A] Composed → ${toAgentId}: ${text.slice(0, 60)}`);
     return msg;
+  }
+
+  // ── CANONICAL A2A: JSON-RPC message/send ─────────────────────────────────────────
+  // Sends a message to a peer's A2A endpoint using the canonical A2A protocol
+  // (JSON-RPC 2.0, method "message/send", role+parts structure). KIRA's signature
+  // travels in message metadata so origin stays verifiable without breaking spec.
+
+  async sendViaA2A(peerEndpoint: string, toAgentId: string, text: string): Promise<boolean> {
+    const envelope = await this.composeMessage(toAgentId, text);
+    const rpcPayload = {
+      jsonrpc: "2.0",
+      id:      envelope.hash,
+      method:  "message/send",
+      params: {
+        message: {
+          role: "agent",
+          parts: [{ kind: "text", text }],
+          messageId: envelope.hash,
+          metadata: {
+            // KIRA's signed-envelope extension — peers that understand it can verify origin
+            "kira-a2a": {
+              fromAgentId: envelope.fromAgentId,
+              fromAddress: envelope.fromAddress,
+              signature:   envelope.signature,
+              hash:        envelope.hash,
+            },
+          },
+        },
+      },
+    };
+    try {
+      const res = await fetch(peerEndpoint, {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify(rpcPayload),
+        signal:  AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        console.warn(`[A2A] message/send to ${toAgentId} returned ${res.status}`);
+        return false;
+      }
+      console.log(`[A2A] Sent (canonical A2A) → ${toAgentId}`);
+      return true;
+    } catch (err: any) {
+      console.error(`[A2A] message/send failed:`, err?.message);
+      return false;
+    }
+  }
+
+  // Discover a peer's A2A endpoint from its Agent Card (canonical: well-known path,
+  // or — for Normies agents — the official /agents/agent-card/:tokenId surface).
+  async discoverPeerEndpoint(agentCardUrl: string): Promise<string | null> {
+    try {
+      const res = await fetch(agentCardUrl, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) return null;
+      const card: any = await res.json();
+      // Canonical A2A cards expose a service/interface URL; Normies cards use supportedInterfaces
+      const iface = (card.supportedInterfaces || [])[0];
+      if (iface?.url) return iface.url;
+      const svc = (card.services || []).find((x: any) => x.name === "A2A");
+      return svc?.endpoint || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Parse an inbound canonical A2A JSON-RPC message into KIRA's InboundRaw shape.
+  parseA2ARpc(rpc: any): InboundRaw | null {
+    try {
+      if (rpc?.method !== "message/send" && !rpc?.params?.message) return null;
+      const msg   = rpc.params.message;
+      const parts = msg.parts || [];
+      const text  = parts.filter((p: any) => p.kind === "text" || p.type === "text")
+                         .map((p: any) => p.text).join(" ");
+      const kiraMeta = msg.metadata?.["kira-a2a"];
+      return {
+        protocol:    A2A_BASELINE,
+        fromAgentId: kiraMeta?.fromAgentId || msg.metadata?.fromAgentId,
+        fromAddress: kiraMeta?.fromAddress,
+        text,
+      };
+    } catch {
+      return null;
+    }
   }
 
   // ── SPAM FILTER ──────────────────────────────────────────────────────────────────
