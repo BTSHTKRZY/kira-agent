@@ -1,6 +1,6 @@
 {
   "name": "kira-agent",
-  "version": "2.0.0",
+  "version": "4.6.0",
   "description": "KIRA — Normie #2635, autonomous on-chain agent",
   "type": "module",
   "main": "dist/index.js",
