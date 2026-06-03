@@ -917,21 +917,23 @@ async function backgroundTasks(): Promise<void> {
           const data = await res.json() as any;
           const messages = Array.isArray(data) ? data : (data.messages || []);
           let answered = 0;
-          for (const raw of messages.slice(0, 10)) {
+          for (const rawMsg of messages.slice(0, 10)) {
+            // Accept either KIRA's envelope shape or a canonical A2A JSON-RPC message
+            const raw = (rawMsg && rawMsg.jsonrpc) ? a2a.parseA2ARpc(rawMsg) : rawMsg;
+            if (!raw) continue;
             const reply = await a2a.handleInbound(raw, state.coreLearnings);
             if (reply) {
               answered++;
-              // Deliver reply if peer endpoint known; else it sits in outbox for relay
-              const peerEndpoint = raw.replyTo || raw.endpoint;
+              // Resolve peer's A2A endpoint (from message, or its Agent Card), then send
+              // via canonical A2A. If unknown, the reply sits in KIRA's outbox for relay.
+              let peerEndpoint = rawMsg.replyTo || rawMsg.endpoint || "";
+              if (!peerEndpoint && (rawMsg.agentCard || rawMsg.tokenId)) {
+                const cardUrl = rawMsg.agentCard ||
+                  `${process.env.NORMIES_API || "https://api.normies.art"}/agents/agent-card/${rawMsg.tokenId}`;
+                peerEndpoint = (await a2a.discoverPeerEndpoint(cardUrl)) || "";
+              }
               if (peerEndpoint) {
-                try {
-                  await fetch(peerEndpoint, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(reply),
-                    signal: AbortSignal.timeout(10000),
-                  });
-                } catch {}
+                await a2a.sendViaA2A(peerEndpoint, reply.toAgentId, reply.text);
               }
             }
           }
