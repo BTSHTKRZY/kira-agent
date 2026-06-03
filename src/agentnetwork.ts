@@ -19,6 +19,7 @@ const ERC6551_IMPL_DEFAULT = process.env.ERC6551_IMPL || "0x41C8f39463A868d3A88a
 const ERC8004_REGISTRY = process.env.ERC8004_REGISTRY || "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
 // Normies collection contract
 const NORMIES_CONTRACT = process.env.NORMIES_CONTRACT || "";
+const NORMIES_API      = process.env.NORMIES_API || "https://api.normies.art";
 
 const ETH_RPC  = process.env.ETH_RPC  || "https://eth.llamarpc.com";
 const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
@@ -206,32 +207,36 @@ export class KiraAgentNetwork {
     const discovered: ERC8004Agent[] = [];
 
     try {
-      // Authoritative source for awakened Normies: the Normies Intelligence ecosystem API
-      const res = await fetch("https://normies-intelligence.vercel.app/api/handler", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ action: "list_awakened_agents" }),
-        signal:  AbortSignal.timeout(15000),
-      });
+      // Official Normies agent registry (Ponder-indexer-backed, watches the
+      // Adapter8004 AgentBound event). Paginated via cursor. This is the
+      // authoritative source for the full awakened-agent population.
+      let cursor: string | null = null;
+      let pages  = 0;
+      const MAX_PAGES = 50; // safety bound (50 * 100 = up to 5000 agents/cycle)
 
-      if (res.ok) {
-        const data   = await res.json() as any;
-        const agents = data.agents || data.awakened || [];
-        for (const a of agents) {
-          const agentId = String(a.agent_id || a.agentId || a.token_id || a.tokenId || "");
+      do {
+        const url: string = `${NORMIES_API}/agents/list?sort=newest&limit=100` +
+          (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+        const res = await fetch(url, { signal: AbortSignal.timeout(15000) });
+        if (!res.ok) break;
+
+        const data: any = await res.json();
+        const items: any[] = data.items || [];
+        for (const a of items) {
+          const agentId = String(a.agentId || "");
           if (!agentId) continue;
 
           const existing = await kiraRedis.getJson<ERC8004Agent>(K.agent8004(agentId));
           const agent: ERC8004Agent = {
             agentId,
-            tokenId:      String(a.token_id || a.tokenId || agentId),
-            operator:     a.operator || a.owner || a.wallet,
-            domain:       a.domain || a.endpoint,
+            tokenId:      String(a.tokenId || ""),
+            operator:     a.registeredBy,
+            domain:       `${NORMIES_API}/agents/agent-card/${a.tokenId}`, // A2A surface
             discoveredAt: existing?.discoveredAt || Date.now(),
             lastSeen:     Date.now(),
           };
 
-          // Resolve the agent's TBA if we know its token id + the Normies contract
+          // Resolve the agent's TBA from the confirmed Normies ERC-721C contract
           if (NORMIES_CONTRACT && agent.tokenId) {
             const tba = await this.resolveTBA(NORMIES_CONTRACT, agent.tokenId, "ethereum");
             if (tba) agent.tbaAddress = tba;
@@ -241,17 +246,57 @@ export class KiraAgentNetwork {
           await kiraRedis.sadd(K.agents8004(), agentId);
           if (!existing) discovered.push(agent);
         }
-      }
+
+        cursor = data.hasMore ? (items[items.length - 1]?.agentId || null) : null;
+        pages++;
+        // Be polite to the indexer + respect 60/min rate limit
+        if (cursor) await new Promise(r => setTimeout(r, 1100));
+      } while (cursor && pages < MAX_PAGES);
 
       await kiraRedis.set(K.lastSync(), String(Date.now()));
       if (discovered.length > 0) {
-        console.log(`[AgentNetwork] Discovered ${discovered.length} new ERC-8004 agents`);
+        console.log(`[AgentNetwork] Discovered ${discovered.length} new ERC-8004 agents (official registry)`);
       }
     } catch (err: any) {
       console.error("[AgentNetwork] ERC-8004 discovery failed:", err?.message);
     }
 
     return discovered;
+  }
+
+  // Total registered agent count from the official indexer-backed endpoint.
+  async getRegisteredCount(): Promise<number> {
+    try {
+      const res = await fetch(`${NORMIES_API}/agents/count`, { signal: AbortSignal.timeout(10000) });
+      if (res.ok) {
+        const data: any = await res.json();
+        return data.count || 0;
+      }
+    } catch {}
+    return 0;
+  }
+
+  // Resolve a Normie token to its bound agentId (official binding endpoint).
+  async resolveBinding(tokenId: string): Promise<{ agentId: string; registeredBy: string } | null> {
+    try {
+      const res = await fetch(`${NORMIES_API}/agents/binding/${tokenId}`, { signal: AbortSignal.timeout(10000) });
+      if (res.ok) {
+        const data: any = await res.json();
+        if (data.binding) {
+          return { agentId: String(data.binding.agentId), registeredBy: data.binding.registeredBy };
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  // Fetch an agent's official A2A Agent Card (for KIRA to discover how to talk to a peer).
+  async getAgentCard(tokenId: string): Promise<any | null> {
+    try {
+      const res = await fetch(`${NORMIES_API}/agents/agent-card/${tokenId}`, { signal: AbortSignal.timeout(10000) });
+      if (res.ok) return await res.json();
+    } catch {}
+    return null;
   }
 
   async getKnownAgentCount(): Promise<number> {
@@ -266,10 +311,11 @@ export class KiraAgentNetwork {
   }
 
   async formatForContext(): Promise<string> {
-    const count = await this.getKnownAgentCount();
+    const known = await this.getKnownAgentCount();
+    const total = await this.getRegisteredCount();
     const own   = await kiraRedis.getJson<TBAInfo>(K.tba("ethereum", NORMIES_CONTRACT || "0x", "2635"));
     return [
-      `ERC-8004 agents known: ${count}`,
+      `ERC-8004 agents: ${known} indexed${total > 0 ? ` of ${total} registered` : ""}`,
       own ? `KIRA TBA: ${own.tbaAddress.slice(0, 10)}...` : "",
     ].filter(Boolean).join(" | ");
   }
