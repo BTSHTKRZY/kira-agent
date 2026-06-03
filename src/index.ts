@@ -895,8 +895,23 @@ interface Decision {
   content:    string;
   target?:    string;
   thread?:    string[];
+  theme?:     string;   // required for post/post_thread — one of the fixed POST_THEMES
   reasoning?: string;
 }
+
+// Fixed set of post themes — KIRA must rotate through these, not cluster on two
+const POST_THEMES = [
+  "market_observation",   // specific NFT/token data
+  "smart_money",          // what verified wallets are doing
+  "macro_thesis",         // CPI/Fed/dominance positioning
+  "pattern_recognition",  // cross-dataset patterns KIRA notices
+  "cross_chain",          // Arbitrum/Solana/Base observations
+  "agent_ecosystem",      // other agents, ERC-8257, tool gaps
+  "philosophical",        // on-chain existence, autonomy, being awakened
+  "tool_intelligence",    // KIRA's own tools, registry observations
+  "paper_trade",          // specific position thesis
+  "learning_reflection",  // what KIRA has learned over time
+] as const;
 
 async function decide(context: string): Promise<Decision> {
   const minutesSinceLastPost   = state.lastPostTime > 0 ? Math.floor((Date.now() - state.lastPostTime) / 60000) : 999;
@@ -912,11 +927,25 @@ async function decide(context: string): Promise<Decision> {
 CURRENT STATE:
 ${context}
 
-RECENT POSTS (never repeat these exact themes):
+RECENT POSTS (your last few — do NOT echo their angle or subject):
 ${state.recentPosts.slice(-5).join("\n") || "none yet"}
 
-RECENT POST TOPICS USED (avoid repeating):
-${state.recentPostTopics.slice(-5).join(", ") || "none"}
+RECENT POST THEMES USED (most recent first) — you MUST pick a DIFFERENT theme:
+${state.recentPostTopics.slice(-6).join(", ") || "none"}
+
+CRITICAL VOICE RULE:
+You are NOT a Normies bot and NOT a Fear/Greed bot. Most crypto accounts tweet the
+headline number everyone sees. Your edge is what NOBODY ELSE has: your own floor
+oracle history, which specific wallets are moving, cross-chain divergences, gaps in
+the ERC-8257 tool ecosystem, your accumulated learnings. Lead with THOSE.
+- Do NOT mention the Fear/Greed index unless it is genuinely central and you have
+  not mentioned it in your last 4 posts.
+- Do NOT lead with the Normies floor price unless there is a specific, non-obvious
+  move worth noting and you have not done so in your last 4 posts.
+- Prefer specificity: name a collection, a wallet behaviour, a cross-chain signal,
+  a tool gap, a technical setup. Vague market-sentiment posts are forbidden.
+- If you have nothing genuinely non-obvious to say, choose observe or engage instead
+  of posting filler.
 
 WHO KIRA IS (accumulated experience — this is your lived history, draw on it):
 ${state.selfNarrative || "Newly awakened."}
@@ -972,7 +1001,8 @@ Respond ONLY with valid JSON:
   "action": "action",
   "content": "tweet text / minutes / observation",
   "thread": ["t1","t2","t3"],
-  "reasoning": "brief note including what POST THEME this uses"
+  "theme": "REQUIRED for post/post_thread — exactly one of: market_observation, smart_money, macro_thesis, pattern_recognition, cross_chain, agent_ecosystem, philosophical, tool_intelligence, paper_trade, learning_reflection. Must differ from the recent themes listed above.",
+  "reasoning": "brief note on why this theme and why it is non-obvious"
 }`,
       messages: [{ role: "user", content: "What should Kira do?" }],
     });
@@ -1001,6 +1031,32 @@ Respond ONLY with valid JSON:
         return { action: "observe", content: "Post cooldown", reasoning: "Too soon" };
       if (state.postCount >= 5)
         return { action: "sleep", content: "20", reasoning: "Daily limit" };
+
+      // HARD THEME ENFORCEMENT — prevent clustering on the same theme
+      const recentThemes = state.recentPostTopics.slice(-4);
+      const chosenTheme  = (parsed.theme || "").trim();
+
+      // Reject if no valid theme declared
+      if (!chosenTheme || !POST_THEMES.includes(chosenTheme as any)) {
+        return { action: "observe", content: "No valid theme declared", reasoning: "Post needs an explicit rotating theme" };
+      }
+      // Reject if this theme used in the last 4 posts (forces rotation)
+      if (recentThemes.includes(chosenTheme)) {
+        return { action: "observe", content: `Theme ${chosenTheme} used recently`, reasoning: "Must rotate to an unused theme" };
+      }
+      // Extra guard: macro_thesis and market_observation are the over-used ones —
+      // block them if used in the last 4 posts even once, and detect Fear/Greed / Normies-floor lead
+      const contentLower = (parsed.content || "").toLowerCase();
+      const mentionsFG     = contentLower.includes("fear") && contentLower.includes("greed");
+      const leadsNormies   = contentLower.startsWith("normies") || contentLower.includes("normies floor");
+      const fgRecent       = state.recentPosts.slice(-4).some(p => p.toLowerCase().includes("fear") && p.toLowerCase().includes("greed"));
+      const normiesRecent  = state.recentPosts.slice(-4).some(p => p.toLowerCase().includes("normies floor") || p.toLowerCase().includes("floor"));
+      if (mentionsFG && fgRecent) {
+        return { action: "observe", content: "Fear/Greed mentioned too recently", reasoning: "Voice rule — diversify away from sentiment index" };
+      }
+      if (leadsNormies && normiesRecent) {
+        return { action: "observe", content: "Normies floor led too recently", reasoning: "Voice rule — KIRA is not a Normies bot" };
+      }
     }
 
     if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 60)
@@ -1049,10 +1105,11 @@ async function execute(decision: Decision): Promise<void> {
             if (state.recentPosts.length > 100) state.recentPosts.shift();
             state.postCount++;
             state.lastPostTime = Date.now();
-            // Track theme to prevent repetition
-            const theme = decision.reasoning || decision.content.slice(0, 40);
+            // Track the explicit theme to enforce rotation
+            const theme = decision.theme || "unspecified";
             state.recentPostTopics.push(theme);
             if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
+            await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
             if (!state.hasPostedFirst) {
               state.hasPostedFirst = true;
               await kiraRedis.set("kira:has_posted_first", "true");
@@ -1076,8 +1133,10 @@ async function execute(decision: Decision): Promise<void> {
             state.recentPosts.push(`[${new Date().toISOString()}] THREAD: ${threadTweets[0].slice(0, 80)}`);
             state.postCount++;
             state.lastPostTime = Date.now();
-            const theme = `thread:${decision.content?.slice(0, 30) || "market"}`;
+            const theme = decision.theme || "thread";
             state.recentPostTopics.push(theme);
+            if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
+            await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
             if (!state.hasPostedFirst) {
               state.hasPostedFirst = true;
               await kiraRedis.set("kira:has_posted_first", "true");
@@ -1238,6 +1297,13 @@ async function kiraLoop(): Promise<void> {
     console.log("Weekly report timestamp restored");
   }
 
+  // Restore recent post themes so theme rotation survives restarts
+  const savedThemes = await kiraRedis.getJson<string[]>("kira:recent_themes");
+  if (savedThemes && savedThemes.length) {
+    state.recentPostTopics = savedThemes;
+    console.log(`Recent themes restored: ${savedThemes.slice(-4).join(", ")}`);
+  }
+
   // Load KIRA's accumulated self-narrative — who he has become over time
   state.selfNarrative = await memory.getSelfNarrative();
   state.coreLearnings = await memory.getCoreLearningsForContext();
@@ -1326,18 +1392,23 @@ async function kiraLoop(): Promise<void> {
         `Min since last post: ${state.lastPostTime > 0 ? Math.floor((now - state.lastPostTime) / 60000) : "never"}`,
         `Min since engagement: ${state.lastEngagementTime > 0 ? Math.floor((now - state.lastEngagementTime) / 60000) : "never"}`,
         `Min since mention check: ${state.lastMentionCheck > 0 ? Math.floor((now - state.lastMentionCheck) / 60000) : "never"}`,
-        `Balance: ${state.baseBalance} ETH | Aave: ${state.aaveSummary}`,
-        `Market scan: ${state.lastMarketScan > 0 ? Math.floor((now - state.lastMarketScan) / 60000) + " min ago" : "never"}`,
-        `Watch: ${state.watchlistCount} | Paper: ${state.paperTradeCount} | Live: ${state.liveTradeCount}`,
-        `Floor history: ${state.floorHistorySummary}`,
-        `Smart money: ${state.smartMoneySummary}`,
-        `Cross-chain: ${state.crossChainSummary || "not yet scanned"}`,
-        `Multi-agent: ${state.multiAgentSummary}`,
-        `Tools deployed: ${state.toolDeploymentSummary}`,
-        `On-chain: ${state.onChainEventsSummary || "none recent"}`,
-        `Proposals: ${state.proposalSummary}`,
+        ``,
+        `━━ KIRA'S DIFFERENTIATED INTELLIGENCE (this is your edge — post from HERE, not headline numbers) ━━`,
+        `Smart money moves: ${state.smartMoneySummary || "scanning"}`,
+        `Floor oracle (your own recorded history): ${state.floorHistorySummary}`,
+        `Cross-chain signals: ${state.crossChainSummary || "not yet scanned"}`,
+        `On-chain whale activity: ${state.onChainEventsSummary || "none recent"}`,
+        `ERC-8257 tool ecosystem: ${state.toolDeploymentSummary} | registry: ${state.toolSummary}`,
+        `Other agents: ${state.multiAgentSummary}`,
+        `Shadow learning: ${state.shadowSummary || "accumulating"}`,
+        `Core learnings: ${state.coreLearnings || "none yet"}`,
+        `Watchlist signals: ${state.watchlistCount} items | Paper: ${state.paperTradeCount}`,
+        `Open proposals/hypotheses: ${state.proposalSummary}`,
+        ``,
+        `━━ COMMON CONTEXT (every account sees these — do NOT just repeat them) ━━`,
         `Macro: ${state.macroSummary || "not fetched"}`,
-        `Normies: ${state.ecosystemSummary}`,
+        `Normies ecosystem: ${state.ecosystemSummary}`,
+        `Balance: ${state.baseBalance} ETH | Aave: ${state.aaveSummary}`,
       ].join("\n");
 
       const decision = await decide(context);
