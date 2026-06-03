@@ -62,13 +62,18 @@ export class KiraCrossChain {
       const topTokens: TokenSnapshot[] = [];
       const boostRes = await fetch(
         "https://api.dexscreener.com/token-boosts/top/v1",
-        { signal: AbortSignal.timeout(10000) }
+        { signal: AbortSignal.timeout(10000), headers: { "accept": "application/json", "user-agent": "kira-agent/4.6" } }
       );
+      if (!boostRes.ok) {
+        console.warn(`[CrossChain] DexScreener boosts HTTP ${boostRes.status} — likely datacenter-IP block; cross-chain feeds need a proxy or keyed source`);
+      }
       if (boostRes.ok) {
         const boosts = await boostRes.json() as any;
+        const total  = Array.isArray(boosts) ? boosts.length : 0;
         const arbBoosts = (Array.isArray(boosts) ? boosts : [])
           .filter((b: any) => b.chainId === "arbitrum")
           .slice(0, 8);
+        console.log(`[CrossChain] DexScreener boosts: ${total} total, ${arbBoosts.length} on Arbitrum`);
 
         for (const b of arbBoosts) {
           // Enrich with real price/volume via the pairs-by-token endpoint
