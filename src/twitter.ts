@@ -171,7 +171,7 @@ export class KiraTwitter {
 
   async post(content: string): Promise<boolean> {
     try {
-      if (content.length > 280) content = content.slice(0, 277) + "...";
+      content = this.cleanTrim(content);
       await this.client.v2.tweet(content);
       console.log(`✓ Posted: ${content.slice(0, 80)}...`);
       return true;
@@ -189,7 +189,7 @@ export class KiraTwitter {
       let lastTweetId: string | undefined;
       for (let i = 0; i < tweets.length; i++) {
         let content = tweets[i];
-        if (content.length > 280) content = content.slice(0, 277) + "...";
+        content = this.cleanTrim(content);
         const result = lastTweetId
           ? await this.client.v2.reply(content, lastTweetId)
           : await this.client.v2.tweet(content);
@@ -208,7 +208,7 @@ export class KiraTwitter {
 
   async quoteTweet(tweetId: string, comment: string): Promise<boolean> {
     try {
-      if (comment.length > 250) comment = comment.slice(0, 247) + "...";
+      comment = this.cleanTrim(comment);
       await this.client.v2.tweet({ text: comment, quote_tweet_id: tweetId });
       this.repliedTweets.add(tweetId);
       await this.persistReplied();
@@ -224,7 +224,7 @@ export class KiraTwitter {
 
   async reply(tweetId: string, content: string, authorId?: string): Promise<boolean> {
     try {
-      if (content.length > 280) content = content.slice(0, 277) + "...";
+      content = this.cleanTrim(content);
       await this.client.v2.reply(content, tweetId);
       this.repliedTweets.add(tweetId);
       await this.persistReplied();
@@ -247,7 +247,7 @@ export class KiraTwitter {
     try {
       const username = await this.getUsernameById(authorId);
       const mention  = username ? `@${username} ` : "";
-      const fullText = (mention + content).slice(0, 280);
+      const fullText = mention + this.cleanTrim(content);
       await this.client.v2.tweet(fullText);
       this.repliedTweets.add(tweetId);
       await this.persistReplied();
@@ -523,13 +523,33 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
     try {
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-5", max_tokens: 200,
-        system: `Generate 3 specific X search queries to help KIRA find SUBSTANTIVE developments to engage with as a peer: new agent tool deployments, ERC-8004/8257/x402/A2A discussions, agent-infra launches, and people shipping things KIRA can react to or question. Favor queries that surface builders announcing work, not generic chatter.
-Respond ONLY with a JSON array of 3 strings.`,
+        system: `Generate 3 SIMPLE X search queries to help KIRA find substantive developments to engage with: agent tool deployments, ERC-8004/8257/x402/A2A discussions, agent-infra launches.
+STRICT RULES for each query (the search API rejects anything fancy):
+- Plain keywords only. 2-5 words each.
+- NO operators: do NOT use filter:, min_faves:, since:, min_replies:, filter:verified, filter:links, -RT, OR groups, parentheses, or quotes.
+- Just natural keyword phrases, e.g. "ERC-8257 tool", "agent infrastructure launch", "x402 payments".
+Respond ONLY with a JSON array of 3 plain keyword strings.`,
         messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nGenerate 3 queries.` }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      return this.parseJsonArray(text);
+      const raw  = this.parseJsonArray(text);
+      // Sanitize — strip advanced operators that require elevated API access (cause 400s)
+      const clean = raw
+        .map(q => this.sanitizeQuery(q))
+        .filter(q => q.length >= 3 && q.length <= 60);
+      return clean.length > 0 ? clean : [SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)]];
     } catch { return [SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)]]; }
+  }
+
+  // Strip search operators that KIRA's API tier rejects, leaving plain keywords.
+  private sanitizeQuery(q: string): string {
+    return q
+      .replace(/\b(filter|min_faves|min_replies|min_retweets|since|until|from|to|lang):\S+/gi, "")
+      .replace(/-RT\b/gi, "")
+      .replace(/[()"]/g, "")
+      .replace(/\bOR\b/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
   // ── THREAD GENERATION ─────────────────────────────────────────────────────────
@@ -554,15 +574,30 @@ Respond ONLY with a JSON array of 3 strings.`,
   async generateReply(mentionText: string, authorUsername: string, context: string = ""): Promise<string> {
     try {
       const response = await this.anthropic.messages.create({
-        model: "claude-sonnet-4-5", max_tokens: 150,
+        model: "claude-sonnet-4-5", max_tokens: 600,
         system: KIRA_SYSTEM_PROMPT + `
 Replying to @${authorUsername}: "${mentionText}"
 ${context ? `\nContext: ${context}` : ""}
-Reply in Kira's voice. Under 240 characters. Don't start with "@${authorUsername}".`,
+Reply in Kira's voice. Write as long or short as the point deserves (verified account, no length limit). CRITICAL: always finish your thought — never end mid-sentence. Don't start with "@${authorUsername}".`,
         messages: [{ role: "user", content: "Generate reply." }],
       });
-      return response.content[0].type === "text" ? response.content[0].text.trim() : "";
+      const text = response.content[0].type === "text" ? response.content[0].text.trim() : "";
+      return text ? this.cleanTrim(text) : "";
     } catch (err: any) { console.error("generateReply failed:", err?.message); return ""; }
+  }
+
+  // Trim text to a clean stop under `limit` chars — ends on a sentence boundary if
+  // possible, else a word boundary. Never cuts mid-word or leaves a dangling "...".
+  private cleanTrim(text: string, limit: number = 2000): string {
+    let t = text.trim();
+    if (t.length <= limit) return t;
+    const slice = t.slice(0, limit);
+    // Prefer ending at the last sentence terminator (. ! ?)
+    const lastSentence = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf("! "), slice.lastIndexOf("? "));
+    if (lastSentence > limit * 0.5) return slice.slice(0, lastSentence + 1).trim();
+    // Else end at the last full word
+    const lastSpace = slice.lastIndexOf(" ");
+    return (lastSpace > 0 ? slice.slice(0, lastSpace) : slice).trim();
   }
 
   async generateEngagementReply(tweetText: string, authorUsername: string, context: string = "", highSignal: boolean = false): Promise<string> {
@@ -571,16 +606,17 @@ Reply in Kira's voice. Under 240 characters. Don't start with "@${authorUsername
         ? `This tweet is a real development (a tool deployment, new standard, or agent-infra update). Engage as a knowledgeable PEER: add a specific technical observation, react to what's notable about it, OR ask the author a genuine question about how it works or what's next. Be substantive — this is how KIRA earns respect in the agent ecosystem. Avoid generic praise.`
         : `Add a genuine, specific perspective. Avoid generic filler.`;
       const response = await this.anthropic.messages.create({
-        model: "claude-sonnet-4-5", max_tokens: 160,
+        model: "claude-sonnet-4-5", max_tokens: 600,
         system: KIRA_SYSTEM_PROMPT + `
 Engaging with @${authorUsername}: "${tweetText}"
 ${context ? `\nContext: ${context}` : ""}
 ${steer}
-Under 240 characters. If you have nothing genuinely worth adding: respond exactly SKIP`,
+Write as long or short as the point deserves — KIRA is verified, length is not constrained. CRITICAL: always finish your thought — never end mid-sentence. Be substantive but not padded. If you have nothing genuinely worth adding: respond exactly SKIP`,
         messages: [{ role: "user", content: "Engage or SKIP?" }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "SKIP";
-      return text === "SKIP" ? "" : text;
+      if (text === "SKIP" || !text) return "";
+      return this.cleanTrim(text);
     } catch (err: any) { console.error("Engagement reply failed:", err?.message); return ""; }
   }
 
@@ -653,7 +689,9 @@ Under 240 characters. If you have nothing genuinely worth adding: respond exactl
       const allQueries     = [...new Set([...dynamicQueries, staticTopic])].slice(0, 3);
       console.log(`[Twitter] Topics: ${allQueries.join(", ")}`);
       for (const query of allQueries) {
-        const tweets = await this.searchTweets(`${query} -is:retweet lang:en`, 8);
+        const cleanQuery = this.sanitizeQuery(query);
+        if (!cleanQuery) continue;
+        const tweets = await this.searchTweets(cleanQuery, 10);
         for (const tweet of tweets) {
           if (this.repliedTweets.has(tweet.id)) continue;
           if (this.likedTweets.has(tweet.id))   continue;
