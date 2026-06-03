@@ -5,6 +5,7 @@
 import { createWalletClient, createPublicClient, http, parseEther, formatEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { mainnet, base } from "viem/chains";
+import { KiraSpendLimit } from "./spendlimit.js";
 
 const RESERVOIR_BASE_URL  = "https://api.reservoir.tools";
 const RESERVOIR_BASE_URL2 = "https://api-base.reservoir.tools";
@@ -46,6 +47,7 @@ export class KiraExecution {
   private baseClient: any;
   private publicEthClient: any;
   private publicBaseClient: any;
+  private spendLimit: KiraSpendLimit = new KiraSpendLimit();
 
   constructor() {
     if (KIRA_PRIVATE_KEY) {
@@ -104,6 +106,13 @@ export class KiraExecution {
         success: false,
         error: `Price ${maxPriceEth} ETH exceeds max ${MAX_NFT_BUY_ETH} ETH`,
       };
+    }
+
+    // DAILY SPEND CEILING — hard stop against cumulative wallet drain
+    const ceilingCheck = await this.spendLimit.checkSpend(maxPriceEth);
+    if (!ceilingCheck.allowed) {
+      console.log(`[Execution] BLOCKED by spend ceiling: ${ceilingCheck.reason}`);
+      return { success: false, error: ceilingCheck.reason };
     }
 
     try {
@@ -188,6 +197,10 @@ export class KiraExecution {
 
           const gasUsed = Number(receipt.gasUsed) * Number(receipt.effectiveGasPrice) / 1e18;
           console.log(`[Execution] ✓ Bought ${collectionName} @ ${listingPriceEth} ETH (gas: ${gasUsed.toFixed(5)} ETH)`);
+
+          // Record against daily spend ceiling (price + gas if configured)
+          const nftSpend = listingPriceEth + (this.spendLimit.countsGas() ? gasUsed : 0);
+          await this.spendLimit.recordSpend(nftSpend, `NFT buy: ${collectionName}`);
 
           return {
             success:   true,
@@ -355,6 +368,13 @@ export class KiraExecution {
       return { success: false, error: `Amount ${amountEth} ETH exceeds max ${MAX_TOKEN_BUY_ETH} ETH` };
     }
 
+    // DAILY SPEND CEILING — hard stop against cumulative wallet drain
+    const tokenCeilingCheck = await this.spendLimit.checkSpend(amountEth);
+    if (!tokenCeilingCheck.allowed) {
+      console.log(`[Execution] BLOCKED by spend ceiling: ${tokenCeilingCheck.reason}`);
+      return { success: false, error: tokenCeilingCheck.reason };
+    }
+
     try {
       // Use 0x API for swap execution (simpler than direct Uniswap)
       const chainId = chain === "base" ? "8453" : "1";
@@ -395,6 +415,8 @@ export class KiraExecution {
 
       const gasUsed = Number(receipt.gasUsed) * Number(receipt.effectiveGasPrice) / 1e18;
       console.log(`[Execution] ✓ Bought ${symbol} @ ${amountEth} ETH (gas: ${gasUsed.toFixed(5)})`);
+      const tokenSpend = amountEth + (this.spendLimit.countsGas() ? gasUsed : 0);
+      await this.spendLimit.recordSpend(tokenSpend, `Token buy: ${symbol}`);
       return { success: true, txHash, pricePaid: amountEth, gasUsed };
 
     } catch (err: any) {
