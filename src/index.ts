@@ -101,6 +101,39 @@ HARD LIMITS:
 - Paper trade only until live mode explicitly enabled (LIVE_TRADING=true)
 - Always propose tool deployments before deploying`;
 
+// Robust JSON extractor — LLM responses sometimes wrap JSON in prose or code fences,
+// or append trailing text after the object. This pulls the first balanced {...} object
+// and parses it, tolerating both. Returns null if nothing parseable is found.
+function extractJson<T>(raw: string): T | null {
+  if (!raw) return null;
+  let s = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+  // Fast path
+  try { return JSON.parse(s) as T; } catch {}
+  // Find the first balanced top-level object
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+    } else {
+      if (c === '"') inStr = true;
+      else if (c === "{") depth++;
+      else if (c === "}") {
+        depth--;
+        if (depth === 0) {
+          const candidate = s.slice(start, i + 1);
+          try { return JSON.parse(candidate) as T; } catch { return null; }
+        }
+      }
+    }
+  }
+  return null;
+}
+
 // ── STATE ─────────────────────────────────────────────────────────────────────
 
 interface KiraState {
@@ -1135,8 +1168,7 @@ Respond ONLY with valid JSON:
     });
 
     const text   = response.content[0].type === "text" ? response.content[0].text : "{}";
-    const clean  = text.replace(/```json|```/g, "").trim();
-    const parsed = JSON.parse(clean) as Decision;
+    const parsed = extractJson<Decision>(text) ?? ({ action: "sleep", content: "15", reasoning: "Unparseable decision" } as Decision);
 
     // Safety overrides
     if (!state.xApiAvailable && ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics"].includes(parsed.action))
