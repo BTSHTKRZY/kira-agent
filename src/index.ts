@@ -786,7 +786,7 @@ async function backgroundTasks(): Promise<void> {
       await multiAgent.discoverAgents();
       const newAgents = await agentNetwork.discoverFromRegistry();
       const agentCount = await agentNetwork.getKnownAgentCount();
-      state.multiAgentSummary = `${await multiAgent.formatForContext()} | ${await agentNetwork.formatForContext()}`;
+      state.multiAgentSummary = `${await agentNetwork.formatForContext()} | legacy: ${await multiAgent.formatForContext()}`;
       state.lastAgentDiscover = now;
       if (newAgents.length > 0) {
         state.recentLearnings.push(`ERC-8004: discovered ${newAgents.length} agents (${agentCount} total known)`);
@@ -1409,6 +1409,9 @@ async function kiraLoop(): Promise<void> {
     const ownTba = await agentNetwork.resolveOwnTBA();
     if (ownTba) console.log(`KIRA TBA (Normie #2635): ${ownTba}`);
     await agentNetwork.discoverFromRegistry();
+    // Reflect the real (agent-network) population in the summary KIRA sees + prints,
+    // not the legacy multiAgent module's count.
+    state.multiAgentSummary = await agentNetwork.formatForContext();
   } catch (err: any) { console.error("Agent network init error:", err?.message); }
   console.log("Modules initialised");
 
