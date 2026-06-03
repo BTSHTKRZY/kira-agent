@@ -309,6 +309,19 @@ export class KiraTwitter {
 
   // ── SMART FOLLOW ──────────────────────────────────────────────────────────────
 
+  // Tolerant JSON-array parse for LLM responses (handles fences + trailing prose).
+  private parseJsonArray(raw: string): string[] {
+    if (!raw) return [];
+    const s = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+    try { return JSON.parse(s) as string[]; } catch {}
+    const start = s.indexOf("[");
+    const end   = s.lastIndexOf("]");
+    if (start !== -1 && end !== -1 && end > start) {
+      try { return JSON.parse(s.slice(start, end + 1)) as string[]; } catch {}
+    }
+    return [];
+  }
+
   async smartFollow(context: string): Promise<number> {
     let followed = 0;
     try {
@@ -319,7 +332,7 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
         messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nSuggest 2-3 accounts.` }],
       });
       const text      = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      const usernames = JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+      const usernames = this.parseJsonArray(text);
 
       for (const username of usernames.slice(0, 3)) {
         if (typeof username !== "string") continue;
@@ -349,17 +362,18 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
   }>> {
     const results: any[] = [];
     try {
-      const params: any = { max_results: 10 };
-      if (this.lastDmId) params.since_id = this.lastDmId;
       const dms    = await this.client.v2.listDmEvents({
-        ...params,
+        max_results: 10,
         "dm_event.fields": ["id", "text", "sender_id", "created_at"],
         expansions:        ["sender_id"],
       } as any);
       const events = (dms as any).data?.data || [];
+      // De-dupe against the last DM we processed (since_id isn't valid for DM events)
+      const lastSeen = this.lastDmId;
       if (events.length > 0) this.lastDmId = events[0].id;
+      const fresh = lastSeen ? events.filter((e: any) => e.id > lastSeen) : events;
 
-      for (const dm of events) {
+      for (const dm of fresh) {
         if (dm.sender_id === this.myUserId) continue;
         const text      = (dm.text || "").trim();
         const textUpper = text.toUpperCase();
@@ -501,7 +515,7 @@ Respond ONLY with a JSON array of 3 strings.`,
         messages: [{ role: "user", content: `Context: ${context.slice(0, 500)}\nGenerate 3 queries.` }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+      return this.parseJsonArray(text);
     } catch { return [SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)]]; }
   }
 
@@ -518,7 +532,7 @@ Respond ONLY with a JSON array of 3 strings.`,
         messages: [{ role: "user", content: `Topic: ${topic}\nContext: ${context.slice(0, 300)}` }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "[]";
-      return JSON.parse(text.replace(/```json|```/g, "").trim()) as string[];
+      return this.parseJsonArray(text);
     } catch (err: any) { console.error("Thread gen failed:", err?.message); return []; }
   }
 
