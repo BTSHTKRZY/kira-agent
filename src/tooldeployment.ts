@@ -460,6 +460,8 @@ APPROVE TOOL:${tool.id}
   async holderReject(toolId: string): Promise<void> {
     const tool = await kiraRedis.getJson<ToolSpec>(K.tool(toolId));
     if (!tool) return;
+    // Idempotent — if already rejected, do nothing (prevents re-email on every redeploy)
+    if (tool.status === "rejected") return;
     tool.status = "rejected";
     await kiraRedis.setJson(K.tool(toolId), tool);
     console.log(`[ToolDeployment] Rejected: ${tool.name}`);
