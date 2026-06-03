@@ -472,8 +472,11 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
 
   async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
     try {
+      // Twitter API v2 search requires max_results between 10 and 100.
+      // Clamp here so callers passing smaller values (e.g. 8) don't trigger a 400.
+      const safeMax = Math.max(10, Math.min(maxResults, 100));
       const results = await this.client.v2.search(query, {
-        max_results: Math.min(maxResults, 100),
+        max_results: safeMax,
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics", "entities"],
         expansions: ["author_id"],
       });
