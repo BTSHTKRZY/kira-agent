@@ -195,6 +195,7 @@ interface KiraState {
   lastA2ACheck:         number;
   researchSummary:      string;
   lastResearchLoop:     number;
+  lastLightScout:       number;
   xApiAvailable:        boolean;
   hasPostedFirst:       boolean;
   baseBalance:          string;
@@ -256,6 +257,7 @@ const state: KiraState = {
   lastA2ACheck:          0,
   researchSummary:       "",
   lastResearchLoop:      0,
+  lastLightScout:        0,
   xApiAvailable:         false,
   hasPostedFirst:        false,
   baseBalance:           "0",
@@ -1459,10 +1461,13 @@ async function execute(decision: Decision): Promise<void> {
             state.researchSummary  = await researchLoop.formatForContext();
             state.lastResearchLoop = Date.now();
             if (result.summary) { state.recentLearnings.push(`Research: ${result.summary}`); console.log(`[Research] (idle-time) ${result.summary}`); }
+          } else if (Date.now() - state.lastLightScout < 45 * 60 * 1000) {
+            // Light scout ran recently — skip to conserve API reads. Just brief pause.
+            console.log("[Research] Light scout on cooldown — conserving API");
           } else {
             // Full 6h cycle not due — but idle time should STILL be productive.
-            // Do a light single-topic scout: search X for one rotating frontier topic,
-            // read a shared link if any, distill one learning. Cheap (1 search + 1 fetch).
+            // Light single-topic scout, gated to ~45min so it doesn't burn reads every cycle.
+            state.lastLightScout = Date.now();
             try {
               const topics = [
                 "ERC-8004 agents","ERC-8257 tool registry","x402 payments","autonomous agent infra",
