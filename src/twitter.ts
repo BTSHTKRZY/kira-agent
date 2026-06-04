@@ -470,18 +470,42 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
 
   // ── SEARCH ────────────────────────────────────────────────────────────────────
 
+  // Search cache — avoids paying for duplicate searches within a short window.
+  private searchCache: Map<string, { ts: number; data: TweetV2[] }> = new Map();
+  private static SEARCH_TTL_MS = 30 * 60 * 1000;
+
   async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
+    // Serve from cache if we searched this query recently (saves API read cost).
+    const key    = query.trim().toLowerCase();
+    const cached  = this.searchCache.get(key);
+    if (cached && Date.now() - cached.ts < KiraTwitter.SEARCH_TTL_MS) {
+      return cached.data;
+    }
     try {
       // Twitter API v2 search requires max_results between 10 and 100.
-      // Clamp here so callers passing smaller values (e.g. 8) don't trigger a 400.
       const safeMax = Math.max(10, Math.min(maxResults, 100));
       const results = await this.client.v2.search(query, {
         max_results: safeMax,
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics", "entities"],
         expansions: ["author_id"],
       });
-      return results.data?.data || [];
-    } catch (err: any) { console.error(`Search failed:`, err?.message); return []; }
+      const data = results.data?.data || [];
+      this.searchCache.set(key, { ts: Date.now(), data });
+      // Bound cache size
+      if (this.searchCache.size > 50) {
+        const oldest = [...this.searchCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        if (oldest) this.searchCache.delete(oldest[0]);
+      }
+      return data;
+    } catch (err: any) {
+      // On 402 (quota exhausted), log clearly so it's diagnosable.
+      if (String(err?.message || "").includes("402") || err?.code === 402) {
+        console.error("[Twitter] Search failed: 402 — X API quota/credits exhausted. Top up credits.");
+      } else {
+        console.error(`Search failed:`, err?.message);
+      }
+      return [];
+    }
   }
 
   // Extract expanded URLs shared inside a set of tweets (deduped, non-twitter links
@@ -684,15 +708,18 @@ Write as long or short as the point deserves — KIRA is verified, length is not
   async engageWithTopics(context: string = ""): Promise<number> {
     let engaged = 0;
     try {
+      const MAX_ACTIONS_PER_CYCLE = 4;   // cap API writes (likes+replies) per cycle to conserve credits
       const dynamicQueries = await this.discoverRelevantTopics(context);
       const staticTopic    = SEARCH_TOPICS[Math.floor(Math.random() * SEARCH_TOPICS.length)];
-      const allQueries     = [...new Set([...dynamicQueries, staticTopic])].slice(0, 3);
+      const allQueries     = [...new Set([...dynamicQueries, staticTopic])].slice(0, 2); // 2 queries, not 3
       console.log(`[Twitter] Topics: ${allQueries.join(", ")}`);
       for (const query of allQueries) {
+        if (engaged >= MAX_ACTIONS_PER_CYCLE) break;
         const cleanQuery = this.sanitizeQuery(query);
         if (!cleanQuery) continue;
         const tweets = await this.searchTweets(cleanQuery, 10);
         for (const tweet of tweets) {
+          if (engaged >= MAX_ACTIONS_PER_CYCLE) break;
           if (this.repliedTweets.has(tweet.id)) continue;
           if (this.likedTweets.has(tweet.id))   continue;
           if (tweet.author_id === this.myUserId) continue;
