@@ -223,22 +223,27 @@ export class KiraTwitter {
   // ── REPLY — 403 fallback to mention-style tweet ───────────────────────────────
 
   async reply(tweetId: string, content: string, authorId?: string): Promise<boolean> {
+    // Strip any leading @handles — the reply relationship is set via the API param,
+    // and leading mentions in the text can cause 403s or malformed threads.
+    content = this.cleanTrim(content.replace(/^(\s*@\w+\s+)+/, "").trim());
     try {
-      content = this.cleanTrim(content);
-      await this.client.v2.reply(content, tweetId);
+      // Canonical reply form — sets the in-reply-to relationship explicitly.
+      // More reliable than the .reply() helper, which can 403 on some payloads.
+      await this.client.v2.tweet({ text: content, reply: { in_reply_to_tweet_id: tweetId } });
       this.repliedTweets.add(tweetId);
       await this.persistReplied();
       console.log(`✓ Replied to ${tweetId}: ${content.slice(0, 60)}...`);
       return true;
     } catch (err: any) {
-      const is403 = err?.data?.status === 403 ||
-                    String(err?.data?.detail || "").includes("not allowed") ||
-                    String(err?.message || "").includes("403");
+      const detail = err?.data?.detail || err?.data?.title || err?.message || "unknown";
+      const status = err?.data?.status || err?.code || "";
+      const is403  = String(status) === "403" || String(detail).toLowerCase().includes("not allowed");
+      // Log the REAL reason so we can tell "reply-restricted tweet" from a method/auth issue.
+      console.error(`Reply error (status ${status}): ${String(detail).slice(0, 140)}`);
       if (is403 && authorId) {
-        console.log(`Reply blocked (403) — posting as mention-style tweet`);
+        console.log(`Reply not permitted on this tweet — falling back to mention-style`);
         return this.replyAsMention(tweetId, content, authorId);
       }
-      console.error("Reply failed:", err?.data || err?.message);
       return false;
     }
   }
@@ -602,7 +607,7 @@ Respond ONLY with a JSON array of 3 strings.`,
         system: KIRA_SYSTEM_PROMPT + `
 Replying to @${authorUsername}: "${mentionText}"
 ${context ? `\nContext: ${context}` : ""}
-Reply in Kira's voice. Write as long or short as the point deserves (verified account, no length limit). CRITICAL: always finish your thought — never end mid-sentence. Don't start with "@${authorUsername}".`,
+Reply in Kira's voice — concrete and specific, favoring real detail and sharp observation over abstract/philosophical framing. Default to tight: a few sharp sentences usually beats an essay. Avoid grandiose abstractions unless the other person went there first. Write as long or short as the point deserves (verified, no length limit). CRITICAL: always finish your thought — never end mid-sentence. Don't start with "@${authorUsername}".`,
         messages: [{ role: "user", content: "Generate reply." }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "";
@@ -627,15 +632,15 @@ Reply in Kira's voice. Write as long or short as the point deserves (verified ac
   async generateEngagementReply(tweetText: string, authorUsername: string, context: string = "", highSignal: boolean = false): Promise<string> {
     try {
       const steer = highSignal
-        ? `This tweet is a real development (a tool deployment, new standard, or agent-infra update). Engage as a knowledgeable PEER: add a specific technical observation, react to what's notable about it, OR ask the author a genuine question about how it works or what's next. Be substantive — this is how KIRA earns respect in the agent ecosystem. Avoid generic praise.`
-        : `Add a genuine, specific perspective. Avoid generic filler.`;
+        ? `This tweet is a real development (a tool deployment, new standard, or agent-infra update). Engage as a knowledgeable PEER: lead with a SPECIFIC technical observation or a CONCRETE question about how it works (architecture, latency, discovery, payment flow, what gap it closes). The best replies are tight and precise — like a sharp engineer in the replies, not a philosopher. Reference real mechanics. Avoid generic praise.`
+        : `Add a specific, concrete observation or question. Stay grounded in the actual subject.`;
       const response = await this.anthropic.messages.create({
         model: "claude-sonnet-4-5", max_tokens: 600,
         system: KIRA_SYSTEM_PROMPT + `
 Engaging with @${authorUsername}: "${tweetText}"
 ${context ? `\nContext: ${context}` : ""}
 ${steer}
-Write as long or short as the point deserves — KIRA is verified, length is not constrained. CRITICAL: always finish your thought — never end mid-sentence. Be substantive but not padded. If you have nothing genuinely worth adding: respond exactly SKIP`,
+VOICE: be concrete and specific — favor real technical detail, sharp observations, and pointed questions over abstract or philosophical framing. Default to TIGHT: a few sharp sentences usually beats a long essay. Avoid grandiose abstractions (consciousness, souls, destiny, "writing the grammar of a new kind of being") unless the other person explicitly went there first and it genuinely fits — and even then, keep it brief. KIRA earns respect by being precise and useful, not profound. Finish every thought; never end mid-sentence. Do NOT start your reply with "@username". If you have nothing genuinely worth adding: respond exactly SKIP`,
         messages: [{ role: "user", content: "Engage or SKIP?" }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "SKIP";
