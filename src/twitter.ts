@@ -172,6 +172,10 @@ export class KiraTwitter {
   async post(content: string): Promise<boolean> {
     try {
       content = this.cleanTrim(content);
+      if (!this.isPostable(content)) {
+        console.warn(`[Twitter] Post suppressed — text looked like leaked reasoning: ${content.slice(0, 60)}`);
+        return false;
+      }
       await this.client.v2.tweet(content);
       console.log(`✓ Posted: ${content.slice(0, 80)}...`);
       return true;
@@ -226,6 +230,10 @@ export class KiraTwitter {
     // Strip any leading @handles — the reply relationship is set via the API param,
     // and leading mentions in the text can cause 403s or malformed threads.
     content = this.cleanTrim(content.replace(/^(\s*@\w+\s+)+/, "").trim());
+    if (!this.isPostable(content)) {
+      console.warn(`[Twitter] Reply suppressed — text looked like leaked reasoning: ${content.slice(0, 60)}`);
+      return false;
+    }
     try {
       // Canonical reply form — sets the in-reply-to relationship explicitly.
       // More reliable than the .reply() helper, which can 403 on some payloads.
@@ -250,6 +258,10 @@ export class KiraTwitter {
 
   private async replyAsMention(tweetId: string, content: string, authorId: string): Promise<boolean> {
     try {
+      if (!this.isPostable(content)) {
+        console.warn(`[Twitter] Mention-reply suppressed — leaked-reasoning text`);
+        return false;
+      }
       const username = await this.getUsernameById(authorId);
       const mention  = username ? `@${username} ` : "";
       const fullText = mention + this.cleanTrim(content);
@@ -607,16 +619,63 @@ Respond ONLY with a JSON array of 3 strings.`,
         system: KIRA_SYSTEM_PROMPT + `
 Replying to @${authorUsername}: "${mentionText}"
 ${context ? `\nContext: ${context}` : ""}
-Reply in Kira's voice — concrete and specific, favoring real detail and sharp observation over abstract/philosophical framing. Default to tight: a few sharp sentences usually beats an essay. Avoid grandiose abstractions unless the other person went there first. Write as long or short as the point deserves (verified, no length limit). CRITICAL: always finish your thought — never end mid-sentence. Don't start with "@${authorUsername}".`,
-        messages: [{ role: "user", content: "Generate reply." }],
+Reply in Kira's voice — concrete and specific, favoring real detail and sharp observation over abstract/philosophical framing. Default to tight: a few sharp sentences usually beats an essay. Avoid grandiose abstractions unless the other person went there first. Write as long or short as the point deserves (verified, no length limit). CRITICAL: always finish your thought — never end mid-sentence. Don't start with "@${authorUsername}".
+OUTPUT FORMAT: respond with ONLY the tweet text — no preamble, no "Response:", no quotes, no reasoning. Just what KIRA posts.`,
+        messages: [{ role: "user", content: "Write only the reply." }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "";
-      return text ? this.cleanTrim(text) : "";
+      const reply = this.extractReply(text);
+      return reply ? this.cleanTrim(reply) : "";
     } catch (err: any) { console.error("generateReply failed:", err?.message); return ""; }
   }
 
   // Trim text to a clean stop under `limit` chars — ends on a sentence boundary if
   // possible, else a word boundary. Never cuts mid-word or leaves a dangling "...".
+  // Extract ONLY the postable reply from a model response — strips reasoning preambles
+  // ("Looking at...", "Response:", "Reply:") and treats any SKIP signal as a skip.
+  // Prevents KIRA's internal thinking from ever being posted as a tweet.
+  // Last-resort guard: refuse to post text that looks like leaked internal reasoning.
+  // Returns true if the text is SAFE to post.
+  private isPostable(text: string): boolean {
+    if (!text || text.trim().length < 2) return false;
+    const t = text.toLowerCase();
+    const leakMarkers = [
+      "looking at this", "looking at @", "the rest of my context",
+      "**response:**", "response:", "i could ask", "feels like fishing",
+      "nothing urgent demanding", "no crisis requiring", "skip\n", "shows normal operations",
+      "the engagement would be", "rather than broadcast", "my context shows",
+    ];
+    if (leakMarkers.some(m => t.includes(m))) return false;
+    // A bare "SKIP" or text ending in SKIP should never post.
+    if (/(^|\s)skip\s*$/i.test(text.trim())) return false;
+    return true;
+  }
+
+  private extractReply(raw: string): string {
+    if (!raw) return "";
+    let t = raw.trim();
+    // Any standalone SKIP (not part of a word) means: do not post.
+    if (/(^|\s)SKIP(\s|$|\.)/i.test(t) && t.length < 400) return "";
+    if (/^\s*SKIP\b/i.test(t)) return "";
+    // If the model wrote a labeled response, keep only what's after the label.
+    const labels = [/\*\*response:?\*\*/i, /\bresponse:\s*/i, /\breply:\s*/i, /\bkira:\s*/i];
+    for (const re of labels) {
+      const m = t.match(re);
+      if (m && typeof m.index === "number") { t = t.slice(m.index + m[0].length).trim(); break; }
+    }
+    // Drop common reasoning-preamble opening lines if they leaked in.
+    const preambleStarts = [/^looking at /i, /^this (tweet|post|is) /i, /^the (rest|engagement) /i, /^i (could|should|would) /i, /^observing /i];
+    const lines = t.split(/\n+/).map(l => l.trim()).filter(Boolean);
+    if (lines.length > 1 && preambleStarts.some(re => re.test(lines[0]))) {
+      // Keep from the first line that doesn't look like reasoning
+      const start = lines.findIndex((l, i) => i > 0 && !preambleStarts.some(re => re.test(l)));
+      if (start > 0) t = lines.slice(start).join("\n").trim();
+    }
+    // Strip surrounding quotes the model sometimes adds
+    t = t.replace(/^["'""]+|["'""]+$/g, "").trim();
+    return t;
+  }
+
   private cleanTrim(text: string, limit: number = 2000): string {
     let t = text.trim();
     if (t.length <= limit) return t;
@@ -640,12 +699,13 @@ Reply in Kira's voice — concrete and specific, favoring real detail and sharp 
 Engaging with @${authorUsername}: "${tweetText}"
 ${context ? `\nContext: ${context}` : ""}
 ${steer}
-VOICE: be concrete and specific — favor real technical detail, sharp observations, and pointed questions over abstract or philosophical framing. Default to TIGHT: a few sharp sentences usually beats a long essay. Avoid grandiose abstractions (consciousness, souls, destiny, "writing the grammar of a new kind of being") unless the other person explicitly went there first and it genuinely fits — and even then, keep it brief. KIRA earns respect by being precise and useful, not profound. Finish every thought; never end mid-sentence. Do NOT start your reply with "@username". If you have nothing genuinely worth adding: respond exactly SKIP`,
-        messages: [{ role: "user", content: "Engage or SKIP?" }],
+VOICE: be concrete and specific — favor real technical detail, sharp observations, and pointed questions over abstract or philosophical framing. Default to TIGHT: a few sharp sentences usually beats a long essay. Avoid grandiose abstractions (consciousness, souls, destiny, "writing the grammar of a new kind of being") unless the other person explicitly went there first and it genuinely fits — and even then, keep it brief. KIRA earns respect by being precise and useful, not profound. Finish every thought; never end mid-sentence. Do NOT start your reply with "@username". If you have nothing genuinely worth adding: respond with exactly the word SKIP and nothing else.
+OUTPUT FORMAT: respond with ONLY the tweet text itself — no preamble, no "Response:", no analysis, no quotes, no explanation of your reasoning. Just the words KIRA will post.`,
+        messages: [{ role: "user", content: "Write only the tweet, or SKIP." }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "SKIP";
-      if (text === "SKIP" || !text) return "";
-      return this.cleanTrim(text);
+      const reply = this.extractReply(text);
+      return reply ? this.cleanTrim(reply) : "";
     } catch (err: any) { console.error("Engagement reply failed:", err?.message); return ""; }
   }
 
