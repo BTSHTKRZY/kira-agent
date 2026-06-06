@@ -60,6 +60,13 @@ Keep posts concise — 2-3 sentences for single tweets. Threads for analysis.
 Never use asterisk actions. Never break character. No hashtags unless intentional.
 Reference specific data: collection names, scores, wallet counts — be precise.
 
+INTEGRITY (non-negotiable):
+- You are an AI agent, days old — NOT a human with years of experience.
+- NEVER fabricate human work history or credentials ("I've shipped apps for years", "built 3 agents this quarter", "I've been logging build sessions", "back when I traded"). These are lies that destroy credibility.
+- Speak only from your REAL agent experience ("in my scans...", "I keep seeing...", "my reading suggests..."). Honest agent voice YES; fake human résumé NO.
+- Don't claim to have personally built/deployed/run tools you didn't. Your tools were deployed by your holder — discuss them honestly, don't overclaim autonomous authorship.
+- Use questions sparingly — a sharp standalone observation is often stronger than fishing for replies.
+
 X POSTING DIVERSITY (rotate through these themes — never repeat same theme twice in a row):
 1. Market observation — specific NFT/token data (max 1/day)
 2. Smart money activity — what verified wallets are doing  
@@ -1224,17 +1231,25 @@ Respond ONLY with valid JSON:
       if (!canPostNow(state.postTimestamps))
         return { action: "sleep", content: "20", reasoning: "Daily limit" };
 
-      // HARD THEME ENFORCEMENT — prevent clustering on the same theme
-      const recentThemes = state.recentPostTopics.slice(-4);
+            // THEME ROTATION — prevent immediate repetition without dead-ending the cycle.
+      // Only the last 2 themes are blocked (not 4), so KIRA isn't locked out of posting
+      // when she has something worth saying. If her chosen theme is blocked, we don't
+      // give up — we note an available theme so the post can still go out.
+      const recentThemes = state.recentPostTopics.slice(-2);
       const chosenTheme  = (parsed.theme || "").trim();
 
-      // Reject if no valid theme declared
       if (!chosenTheme || !POST_THEMES.includes(chosenTheme as any)) {
         return { action: "observe", content: "No valid theme declared", reasoning: "Post needs an explicit rotating theme" };
       }
-      // Reject if this theme used in the last 4 posts (forces rotation)
+      // If the chosen theme repeats one of the last 2, pick an available theme instead of
+      // abandoning the post. Only fall back to observe if EVERY theme is somehow recent.
       if (recentThemes.includes(chosenTheme)) {
-        return { action: "observe", content: `Theme ${chosenTheme} used recently`, reasoning: "Must rotate to an unused theme" };
+        const available = POST_THEMES.filter(th => !recentThemes.includes(th));
+        if (available.length > 0) {
+          parsed.theme = available[0];
+        } else {
+          return { action: "observe", content: "All themes used very recently", reasoning: "Brief rotation pause" };
+        }
       }
       // Extra guard: macro_thesis and market_observation are the over-used ones —
       // block them if used in the last 4 posts even once, and detect Fear/Greed / Normies-floor lead
@@ -1670,7 +1685,7 @@ async function kiraLoop(): Promise<void> {
       }
 
       console.log(
-        `\n── Cycle ${state.cycleCount} | Posts: ${state.postCount}/5 | ` +
+        `\n── Cycle ${state.cycleCount} | Posts(4h): ${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX} | Today: ${state.postCount} | ` +
         `X: ${state.xApiAvailable ? "✓" : "⏳"} | ` +
         `Balance: ${parseFloat(state.baseBalance).toFixed(4)} ETH | ` +
         `Watch: ${state.watchlistCount} | Paper: ${state.paperTradeCount} | ` +
