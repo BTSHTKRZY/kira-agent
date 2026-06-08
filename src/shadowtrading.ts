@@ -22,6 +22,10 @@ export interface ShadowPosition {
   pnlPct?:      number;
   resolved:     boolean;
   horizonDays:  number;   // when to check (7d default)
+  // Observability only — interim price snapshot at the ~2d checkpoint. Does NOT
+  // resolve the shadow or move weights; purely lets us watch learning forming early.
+  interimPnlPct?: number;
+  interimTime?:   number;
 }
 
 export interface SignalPerformance {
@@ -130,6 +134,67 @@ export class KiraShadowTrading {
     }
 
     return resolved;
+  }
+
+  // ── OBSERVABILITY CHECKPOINT (Option C) ───────────────────────────────────────
+  // Looks at shadows aged >= CHECKPOINT_DAYS but not yet at full horizon, takes an
+  // INTERIM price snapshot, and reports a PROVISIONAL per-signal trend. This does NOT
+  // resolve the shadow and does NOT move scoring weights — it exists purely so we can
+  // WATCH learning forming days before the 7-day horizon lets it act. Keeps weight
+  // adjustments on the quality (7d) signal while giving early, risk-free visibility.
+  private static CHECKPOINT_DAYS = 2;
+
+  async checkpointTrends(
+    getPriceNFT:   (a: string, c: string) => Promise<number>,
+    getPriceToken: (a: string, c: string) => Promise<number>
+  ): Promise<string> {
+    const ids = await kiraRedis.smembers(K.shadows());
+    const tally: Record<string, { up: number; total: number; pnlSum: number }> = {};
+    let checkpointed = 0;
+
+    for (const id of ids) {
+      const shadow = await kiraRedis.getJson<ShadowPosition>(K.shadow(id));
+      if (!shadow || shadow.resolved) continue;
+
+      const ageMs = Date.now() - shadow.entryTime;
+      const checkpointMs = KiraShadowTrading.CHECKPOINT_DAYS * 86400000;
+      const horizonMs    = shadow.horizonDays * 86400000;
+      if (ageMs < checkpointMs || ageMs >= horizonMs) continue;
+
+      let price = 0;
+      try {
+        price = shadow.type === "nft"
+          ? await getPriceNFT(shadow.address, shadow.chain)
+          : await getPriceToken(shadow.address, shadow.chain);
+      } catch {}
+      if (price <= 0) continue;
+
+      const interimPnl = ((price - shadow.entryPrice) / shadow.entryPrice) * 100;
+      shadow.interimPnlPct = interimPnl;
+      shadow.interimTime   = Date.now();
+      await kiraRedis.setJson(K.shadow(id), shadow);
+      checkpointed++;
+
+      for (const [sig, val] of Object.entries(shadow.signals || {})) {
+        if (!val || val <= 0) continue;
+        if (!tally[sig]) tally[sig] = { up: 0, total: 0, pnlSum: 0 };
+        tally[sig].total += 1;
+        tally[sig].pnlSum += interimPnl;
+        if (interimPnl > 0) tally[sig].up += 1;
+      }
+    }
+
+    if (checkpointed === 0) return "";
+
+    const lines: string[] = [];
+    for (const [sig, t] of Object.entries(tally)) {
+      if (t.total < 3) continue;
+      const winRate = Math.round((t.up / t.total) * 100);
+      const avgPnl  = (t.pnlSum / t.total).toFixed(1);
+      lines.push(`${sig}: ${winRate}% up @ ${t.total} (avg ${avgPnl}%)`);
+    }
+    if (lines.length === 0) return `interim checkpoint: ${checkpointed} positions snapshotted (no signal has 3+ yet)`;
+    return `interim signal trends (provisional, not applied): ${lines.join(" | ")}`;
   }
 
   // Update per-signal performance stats based on a resolved shadow
