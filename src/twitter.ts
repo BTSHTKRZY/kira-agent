@@ -501,9 +501,22 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
   private searchCache: Map<string, { ts: number; data: TweetV2[] }> = new Map();
   private static SEARCH_TTL_MS = 30 * 60 * 1000;
 
-  async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
+    async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
+    // Sanitize at the chokepoint so NO caller can send elevated-access operators
+    // (from:, filter:, min_faves:, etc.) — those return HTTP 400 on pay-per-use and
+    // were the cause of the research loop's "Search failed: code 400 / 0 findings".
+    // A bare "from:handle" would sanitize to empty, so first convert it to a plain
+    // term search for that handle (keeps account-scouting working without the operator).
+    let q = query;
+    const fromMatch = q.match(/\bfrom:(\w+)/i);
+    if (fromMatch) {
+      q = q.replace(/\bfrom:\w+/gi, fromMatch[1]); // "from:CodinCowboy" -> "CodinCowboy"
+    }
+    q = this.sanitizeQuery(q);
+    if (!q || q.length < 3) return [];
+
     // Serve from cache if we searched this query recently (saves API read cost).
-    const key    = query.trim().toLowerCase();
+    const key    = q.trim().toLowerCase();
     const cached  = this.searchCache.get(key);
     if (cached && Date.now() - cached.ts < KiraTwitter.SEARCH_TTL_MS) {
       return cached.data;
@@ -511,7 +524,7 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
     try {
       // Twitter API v2 search requires max_results between 10 and 100.
       const safeMax = Math.max(10, Math.min(maxResults, 100));
-      const results = await this.client.v2.search(query, {
+      const results = await this.client.v2.search(q, {
         max_results: safeMax,
         "tweet.fields": ["author_id", "text", "created_at", "public_metrics", "entities"],
         expansions: ["author_id"],
