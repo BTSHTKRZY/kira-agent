@@ -136,6 +136,11 @@ export class KiraScoring {
     if (!ok) console.error("Failed to save signal weights");
   }
 
+  // Snapshot of current weights for observability / posting accurate "I adjusted X" claims.
+  getWeightsSnapshot(): SignalWeights {
+    return JSON.parse(JSON.stringify(this.weights));
+  }
+
   // ── NFT SCORING ──────────────────────────────────────────────────────────────
 
   scoreNFT(
@@ -484,6 +489,98 @@ export class KiraScoring {
   }
 
   getWeights(): SignalWeights { return this.weights; }
+
+  // ── #13 EXPLAINABILITY LAYER ──────────────────────────────────────────────────
+  // Produces a structured "why" for any NFT/token score — key drivers, risk factors,
+  // and a recommended action with reasoning — modeled on agent-native schemas (e.g.
+  // Zambo's key_drivers / market_relevance). This makes KIRA's scores legible to other
+  // agents and humans (and is the foundation for exposing scoring AS a tool later),
+  // instead of emitting a bare number. Reads the score's existing per-signal points;
+  // does not re-score, so it can't disagree with the score it explains.
+  //
+  // Human-readable label per signal for explanations.
+  private static SIGNAL_LABELS: Record<string, string> = {
+    floorDipDepth:     "floor dip depth",
+    floorStabilizing:  "floor stabilizing",
+    holderTrend:       "holder trend",
+    avgHoldDuration:   "average hold duration",
+    knownWalletBuying: "smart-money buying",
+    volumeRecovery:    "volume recovery",
+    washTradeClean:    "wash-trade cleanliness",
+    macroContext:      "macro context",
+    priceVs24hAvg:     "price vs 24h average",
+    momentumStrength:  "momentum strength",
+    volumeTrend:       "volume trend",
+    liquidityDepth:    "liquidity depth",
+    normiesWalletFlow: "Normies wallet flow",
+    technicalScore:    "technical signals",
+  };
+
+  explainScore(score: NFTScore | TokenScore): {
+    subject:        string;
+    totalScore:     number;
+    decision:       string;
+    confidence:     string;
+    keyDrivers:     Array<{ signal: string; contribution: number; note: string }>;
+    riskFactors:    Array<{ signal: string; contribution: number; note: string }>;
+    recommendation: string;
+    reasoning:      string;
+  } {
+    const subject = "collection" in score ? score.collection : `${score.symbol}`;
+    const labelOf = (k: string) => KiraScoring.SIGNAL_LABELS[k] || k;
+
+    // Rank signals by contribution. Positive = driver, negative = risk.
+    const entries = Object.entries(score.signals)
+      .filter(([k]) => k !== "")
+      .map(([k, v]) => ({ signal: labelOf(k), contribution: Number(v) || 0 }));
+
+    const drivers = entries
+      .filter(e => e.contribution > 0)
+      .sort((a, b) => b.contribution - a.contribution)
+      .slice(0, 3)
+      .map(e => ({ ...e, note: `+${e.contribution.toFixed(1)} pts — strongest support` }));
+
+    const risks = entries
+      .filter(e => e.contribution < 0)
+      .sort((a, b) => a.contribution - b.contribution)
+      .slice(0, 3)
+      .map(e => ({ ...e, note: `${e.contribution.toFixed(1)} pts — weighing against` }));
+
+    // Honest, decision-aligned recommendation text.
+    let recommendation: string;
+    if (score.decision === "buy") {
+      recommendation = `Score ${score.totalScore} clears the buy threshold — actionable, ${score.confidence} confidence.`;
+    } else if (score.decision === "watchlist") {
+      recommendation = `Score ${score.totalScore} is in watch range — monitor, not yet actionable (${score.confidence} confidence).`;
+    } else {
+      recommendation = `Score ${score.totalScore} below watch range — pass for now.`;
+    }
+
+    const driverText = drivers.length
+      ? `Driven by ${drivers.map(d => d.signal).join(", ")}.`
+      : "No strong positive drivers.";
+    const riskText = risks.length
+      ? ` Held back by ${risks.map(r => r.signal).join(", ")}.`
+      : "";
+
+    return {
+      subject,
+      totalScore:     score.totalScore,
+      decision:       score.decision,
+      confidence:     score.confidence,
+      keyDrivers:     drivers,
+      riskFactors:    risks,
+      recommendation,
+      reasoning:      `${score.thesis} ${driverText}${riskText}`.trim(),
+    };
+  }
+
+  // One-line explanation for posts/logs.
+  explainScoreBrief(score: NFTScore | TokenScore): string {
+    const e = this.explainScore(score);
+    const drivers = e.keyDrivers.map(d => d.signal).join(", ") || "no strong drivers";
+    return `${e.subject}: ${e.totalScore}/100 (${e.decision}) — key drivers: ${drivers}`;
+  }
 
   formatWeightsForContext(): string {
     const nft   = Object.entries(this.weights.nft)
