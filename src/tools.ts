@@ -1,6 +1,16 @@
-const REGISTRY_CONTRACT = "0x265BB2DBFC0A8165C9A1941Eb1372F349baD2cf1";
-const BASE_RPC          = process.env.BASE_RPC || "https://mainnet.base.org";
-const AGENTCHECK_URL    = process.env.AGENTCHECK_URL || "https://agentcheck-bice.vercel.app";
+// tools.ts
+// KiraTools — thin wrapper over the live ERC-8257 registry client (toolregistry.ts).
+//
+// HISTORY / WHY THIS CHANGED:
+// The previous version did a raw eth_call to the registry and, on any failure,
+// returned a HARDCODED 18 — which is why KIRA broadcast "18 tools" indefinitely
+// even after being publicly corrected to 32. It also hardcoded the claim that
+// KIRA "operates Tool #7 and #13". Both are removed. Counts now come from the
+// real OpenSea list_tools API (fully paginated), and KIRA's own tools are
+// identified by matching the registry `creator` to her wallets — or reported
+// honestly as unknown if the data isn't available.
+
+import { ToolRegistry } from "./toolregistry.js";
 
 export interface ToolInfo {
   id:          number;
@@ -11,41 +21,37 @@ export interface ToolInfo {
 }
 
 export class KiraTools {
+  private registry: ToolRegistry = new ToolRegistry();
   private lastScan: number = 0;
 
-  async getToolCount(): Promise<number> {
-    try {
-      const controller = new AbortController();
-      const timeout    = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(BASE_RPC, {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          jsonrpc: "2.0",
-          method:  "eth_call",
-          params:  [{ to: REGISTRY_CONTRACT, data: "0x0a12f9b1" }, "latest"],
-          id:      1,
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      const data  = await res.json() as any;
-      const count = parseInt(data.result, 16);
-      return isNaN(count) ? 18 : count;
-    } catch {
-      return 18;
-    }
+  // Real, fully-paginated count. Returns null if the registry is unreachable
+  // (callers must handle null rather than fall back to a fabricated number).
+  async getToolCount(): Promise<number | null> {
+    const count = await this.registry.getToolCount();
+    this.lastScan = Date.now();
+    return count;
   }
 
+  // Honest summary — never fabricates a count, never asserts "#7 and #13"
+  // unless the live registry shows tools created by KIRA's wallets.
   async getSummary(): Promise<string> {
-    try {
-      const count = await this.getToolCount();
-      this.lastScan = Date.now();
-      return `${count} tools on ERC-8257 registry on Base. KIRA operates Tool #7 (Normies Intelligence) and Tool #13 (AgentCheck). Certification predicate live at 0x38530729...`;
-    } catch {
-      this.lastScan = Date.now();
-      return "18 tools on ERC-8257 registry. KIRA operates Tool #7 and Tool #13.";
-    }
+    const summary = await this.registry.getSummary();
+    this.lastScan = Date.now();
+    return summary;
+  }
+
+  // Expose the structured snapshot for modules that want real data
+  // (gap detection, posting with accurate figures, tool consumption).
+  async getSnapshot() {
+    return this.registry.getSnapshot();
+  }
+
+  async getKiraTools() {
+    return this.registry.getKiraTools();
+  }
+
+  async getTool(toolId: string) {
+    return this.registry.getTool(toolId);
   }
 
   needsScan(): boolean {
