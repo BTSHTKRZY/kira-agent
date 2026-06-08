@@ -501,7 +501,7 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
   private searchCache: Map<string, { ts: number; data: TweetV2[] }> = new Map();
   private static SEARCH_TTL_MS = 30 * 60 * 1000;
 
-    async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
+  async searchTweets(query: string, maxResults: number = 10): Promise<TweetV2[]> {
     // Sanitize at the chokepoint so NO caller can send elevated-access operators
     // (from:, filter:, min_faves:, etc.) — those return HTTP 400 on pay-per-use and
     // were the cause of the research loop's "Search failed: code 400 / 0 findings".
@@ -622,7 +622,7 @@ Respond ONLY with a JSON array of 3 plain keyword strings.`,
       .replace(/\s+/g, " ")
       .trim();
   }
-  
+
   // ── THREAD GENERATION ─────────────────────────────────────────────────────────
 
   async generateThread(topic: string, context: string): Promise<string[]> {
@@ -668,16 +668,39 @@ OUTPUT FORMAT: respond with ONLY the tweet text — no preamble, no "Response:",
   // Returns true if the text is SAFE to post.
   private isPostable(text: string): boolean {
     if (!text || text.trim().length < 2) return false;
-    const t = text.toLowerCase();
+    const raw = text.trim();
+    const t = raw.toLowerCase();
+    // S2 SECRET OUTPUT FILTER (hard backstop): never let anything secret-shaped go out.
+    // Keys are never in KIRA's context by design, so this should never fire — it exists
+    // as defense-in-depth in case a secret ever reaches an output path.
+    const secretPatterns: RegExp[] = [
+      /0x[a-f0-9]{64}\b/i,                          // 32-byte hex (private key shape)
+      /\b([a-z]+\s+){11,23}[a-z]+\b/i,              // 12/24-word mnemonic shape (long all-lowercase word run)
+      /\b(sk|pk|api[_-]?key|secret|seed phrase|mnemonic|private key)\b[:=]\s*\S+/i,
+      /\b(BASE_RPC|ETH_RPC|OPENSEA_API_KEY|KIRA_PRIVATE_KEY|ANTHROPIC_API_KEY|UPSTASH|REDIS_URL)\b/i,
+    ];
+    if (secretPatterns.some(re => re.test(raw))) {
+      console.error("[Twitter] BLOCKED outgoing text matching a secret pattern — not posting.");
+      return false;
+    }
+    // Phrase blocklist — known reasoning/scratchpad leaks.
     const leakMarkers = [
       "looking at this", "looking at @", "the rest of my context",
-      "**response:**", "response:", "i could ask", "feels like fishing",
-      "nothing urgent demanding", "no crisis requiring", "skip\n", "shows normal operations",
+      "**response:**", "response:", "reply:", "i could ask", "feels like fishing",
+      "nothing urgent demanding", "no crisis requiring", "shows normal operations",
       "the engagement would be", "rather than broadcast", "my context shows",
+      "let's engage", "lets engage", "i'll respond", "i will respond", "i should reply",
+      "worth engaging", "i'll reply", "i should engage", "let me engage", "let me reply",
+      "decision:", "reasoning:", "my response would be", "here's my reply", "heres my reply",
+      "i'll engage", "no compelling", "engagement cooldown", "scan cooldown",
     ];
     if (leakMarkers.some(m => t.includes(m))) return false;
-    // A bare "SKIP" or text ending in SKIP should never post.
-    if (/(^|\s)skip\s*$/i.test(text.trim())) return false;
+    // Any standalone/leading/trailing SKIP.
+    if (/(^|\s)skip(\s|$|\.)/i.test(raw) && raw.length < 400) return false;
+    // General reasoning-shape: starts with first-person planning verbs.
+    if (/^(i'?ll|i will|i should|i could|i'?m going to|let me|let'?s|looking at|observing|considering|my plan|the plan|first,|step \d)/i.test(raw)) return false;
+    // Meta-references to KIRA's own decision machinery.
+    if (/\b(post slot|post window|cooldown|differentiated signal|voice rule|frontier learnings?|action available)\b/i.test(raw)) return false;
     return true;
   }
 
@@ -720,7 +743,7 @@ OUTPUT FORMAT: respond with ONLY the tweet text — no preamble, no "Response:",
 
   async generateEngagementReply(tweetText: string, authorUsername: string, context: string = "", highSignal: boolean = false): Promise<string> {
     try {
-            const steer = highSignal
+      const steer = highSignal
         ? `This tweet is a real development (a tool deployment, new standard, or agent-infra update). Engage as a knowledgeable PEER: lead with a SPECIFIC technical observation about what's notable. A pointed question is good ONLY when you genuinely want the answer — don't tack one on reflexively; a sharp standalone take is often stronger. Tight and precise, like an engineer in the replies, not a philosopher. Reference real mechanics. No generic praise. And never fabricate having built or shipped things yourself.`
         : `Add a specific, concrete observation. Ask a question only if you genuinely want the answer. Stay grounded in the actual subject; don't fabricate personal experience.`;
       const response = await this.anthropic.messages.create({
