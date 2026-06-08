@@ -46,7 +46,7 @@ const KNOWN_AGENTS: Array<{
   isNormies: boolean;
 }> = [
   // Other Normies agents — will grow as more awaken
-    // KIRA's tool IDs are NOT hardcoded here — tool ownership is resolved from the
+  // KIRA's tool IDs are NOT hardcoded here — tool ownership is resolved from the
   // live ERC-8257 registry by matching the `creator` field to KIRA's wallets
   // (see toolregistry.ts getKiraTools). Hardcoding "7"/"13" caused KIRA to assert
   // tool ownership she couldn't verify; leave empty and let live data populate it.
