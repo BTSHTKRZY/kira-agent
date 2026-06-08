@@ -25,6 +25,8 @@ const K = {
   findings:    () => `kira:research:findings`,
   buildRecs:   () => `kira:research:buildrecs`,
   seenSources: () => `kira:research:seen`,
+  dynamicTopics: () => `kira:research:dynamic_topics`,   // #5 self-expanded scout topics
+  gapHits:       () => `kira:research:gap_hits`,          // #11 capability-gap frequency
   postQueue:   () => `kira:research:postqueue`,
 };
 
@@ -107,8 +109,8 @@ export class KiraResearchLoop {
     let postsQueued = 0;
 
     try {
-      // STAGE 1: SCOUT — base rotation + learning-derived follow-ups (cost-bounded)
-      const baseQueries = this.pickQueries(2);
+      // STAGE 1: SCOUT — base rotation + self-expanded topics + learning follow-ups
+      const baseQueries = await this.pickQueriesExpanded(2);
       let followUps: string[] = [];
       if (tools.learningTerms) {
         try { followUps = (await tools.learningTerms()).slice(0, 1); } catch {}
@@ -185,6 +187,13 @@ export class KiraResearchLoop {
           `${f.summary} [source: ${f.source}]`,
           Math.min(0.7, f.relevance)
         );
+        // #5 self-expansion: a genuinely high-signal finding promotes a standing topic
+        // so KIRA's research surface widens toward what's proving important over time.
+        if (f.relevance >= 0.7) {
+          // Use the most distinctive 2-4 word phrase from the title as the new topic.
+          const term = f.title.split(/[:\-—|.]/)[0].trim().split(/\s+/).slice(0, 4).join(" ");
+          if (term) await this.promoteTopic(term);
+        }
         // Queue a post if it's genuinely notable frontier intelligence
         if (f.relevance >= 0.65 && (f.category === "standard" || f.category === "protocol" || f.category === "tool")) {
           await this.queuePost(f);
@@ -197,6 +206,10 @@ export class KiraResearchLoop {
         const rec = await this.makeBuildRec(f);
         if (rec) buildRecs.push(rec);
       }
+      // #11: escalate recurring capability gaps KIRA keeps hitting but can't act on.
+      const gapRecs = await this.trackAndEscalateGaps(findings);
+      if (gapRecs.length > 0) buildRecs.push(...gapRecs);
+
       if (buildRecs.length > 0) await this.sendBuildRecs(buildRecs);
 
       // STAGE 7: RECORD
@@ -217,6 +230,37 @@ export class KiraResearchLoop {
       await kiraRedis.set(K.lastCycle(), String(Date.now())); // don't hammer on failure
       return { findings, buildRecs, postsQueued, summary: `Cycle halted: ${err?.message}` };
     }
+  }
+
+  // #5 WIDER ACCESS / SELF-EXPANSION: pick from the seed topics PLUS topics KIRA has
+  // promoted over time from her own high-signal learnings. Her research surface widens
+  // as she discovers what matters, instead of being permanently fixed at the 8 seeds.
+  // Promotion is gated (a term must recur with real signal before it earns a slot) and
+  // the dynamic set is capped, so this widens inputs without unbounded drift.
+  private async pickQueriesExpanded(n: number): Promise<string[]> {
+    const dynamic = (await kiraRedis.getJson<string[]>(K.dynamicTopics())) || [];
+    const pool    = [...SCOUT_QUERIES, ...dynamic];
+    const offset  = Math.floor(Date.now() / CYCLE_INTERVAL_MS) % pool.length;
+    const picked: string[] = [];
+    for (let i = 0; i < n; i++) picked.push(pool[(offset + i) % pool.length]);
+    return picked;
+  }
+
+  // Promote a recurring, high-signal term into KIRA's standing scout topics.
+  // Called when a learning has proven valuable enough to deserve continuous coverage.
+  // Capped and de-duped so the input set grows deliberately, not chaotically.
+  async promoteTopic(term: string): Promise<boolean> {
+    const t = term.trim();
+    if (!t || t.length < 4 || t.length > 60) return false;
+    // Don't promote something already covered by a seed or existing dynamic topic.
+    const lower = t.toLowerCase();
+    if (SCOUT_QUERIES.some(q => q.toLowerCase().includes(lower) || lower.includes(q.toLowerCase()))) return false;
+    const dynamic = (await kiraRedis.getJson<string[]>(K.dynamicTopics())) || [];
+    if (dynamic.some(q => q.toLowerCase() === lower)) return false;
+    const updated = [t, ...dynamic].slice(0, 12); // cap the self-expanded set
+    await kiraRedis.setJson(K.dynamicTopics(), updated);
+    console.log(`[Research] Promoted new standing topic: "${t}" (dynamic set now ${updated.length})`);
+    return true;
   }
 
   private pickQueries(n: number): string[] {
@@ -285,6 +329,48 @@ Respond ONLY with JSON:
     };
     await kiraRedis.setJson(K.buildRecs(), [rec, ...existing].slice(0, 50));
     return rec;
+  }
+
+  // #11 CAPABILITY-GAP ESCALATION — KIRA notices her OWN limits and flags them.
+  // When research repeatedly surfaces the same kind of thing she can't act on (a
+  // "needs_code" finding category recurring across cycles), she escalates it to the
+  // holder as a build-rec: "I keep hitting X but lack the capability/access to act —
+  // consider building Y." This is the agent identifying and articulating its own
+  // limitations rather than silently working around them forever.
+  //
+  // Gated by frequency so a one-off doesn't spam the inbox — a gap must recur
+  // GAP_ESCALATE_THRESHOLD times before it's escalated, and each gap escalates once.
+  private static GAP_ESCALATE_THRESHOLD = 4;
+
+  private async trackAndEscalateGaps(findings: Finding[]): Promise<BuildRec[]> {
+    const gaps = (await kiraRedis.getJson<Record<string, { count: number; escalated: boolean; example: string }>>(K.gapHits())) || {};
+    const escalated: BuildRec[] = [];
+
+    // Count this cycle's needs_code findings by category as recurring "gaps".
+    for (const f of findings) {
+      if (f.actionable !== "needs_code") continue;
+      const key = f.category; // gap bucketed by category (tool/protocol/infra/etc.)
+      if (!gaps[key]) gaps[key] = { count: 0, escalated: false, example: f.title };
+      gaps[key].count += 1;
+      gaps[key].example = f.title;
+
+      if (gaps[key].count >= KiraResearchLoop.GAP_ESCALATE_THRESHOLD && !gaps[key].escalated) {
+        gaps[key].escalated = true;
+        escalated.push({
+          id:          `GAP-${key}-${Date.now()}`,
+          title:       `Recurring capability gap: "${key}" developments KIRA can't act on`,
+          rationale:   `KIRA has now hit ${gaps[key].count} "${key}" developments that need code she doesn't have — e.g. "${gaps[key].example}". This is a recurring limitation worth addressing, not a one-off.`,
+          whatItNeeds: `Review whether KIRA should gain a capability to act on "${key}" developments (e.g. consuming/integrating them), or whether these should keep routing to manual review.`,
+          priority:    "medium",
+          source:      "capability-gap-escalation",
+          ts:          Date.now(),
+          sent:        false,
+        });
+      }
+    }
+
+    await kiraRedis.setJson(K.gapHits(), gaps);
+    return escalated;
   }
 
   private async sendBuildRecs(recs: BuildRec[]): Promise<void> {
