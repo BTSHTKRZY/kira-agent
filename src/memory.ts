@@ -111,6 +111,62 @@ export class KiraMemory {
       .slice(0, limit);
   }
 
+  // ── #8 RELEVANCE-WEIGHTED RETRIEVAL ───────────────────────────────────────────
+  // Surfaces the learnings actually relevant to the CURRENT decision, weighted by
+  // proven value — instead of always returning the same global top-N ("dump all
+  // memories"). Relevance = term overlap between the decision context and each
+  // learning's text; value = confidence × reinforced. The combined score means a
+  // moderately-proven learning that's ON-TOPIC can outrank a highly-proven one that's
+  // irrelevant to what KIRA is deciding right now. This is the difference between
+  // "recall everything" and "recall what matters here".
+  //
+  // Honest note: this is lexical overlap, not semantic embeddings — it's a real,
+  // measurable improvement over global top-N, but it's not deep understanding. A
+  // future upgrade could use embeddings; this is the tractable, verifiable version.
+  async getRelevantLearnings(context: string, limit: number = 6): Promise<CoreLearning[]> {
+    const learnings = await kiraRedis.getJson<CoreLearning[]>(K.core()) || [];
+    if (learnings.length === 0) return [];
+
+    // Build a term set from the current decision context (lowercased words >3 chars).
+    const ctxTerms = new Set(
+      (context || "").toLowerCase().match(/[a-z0-9]{4,}/g) || []
+    );
+    if (ctxTerms.size === 0) return this.getCoreLearnings(limit); // no context → fall back
+
+    const scored = learnings.map(l => {
+      const text  = `${l.insight} ${l.evidence}`.toLowerCase();
+      const terms = text.match(/[a-z0-9]{4,}/g) || [];
+      let overlap = 0;
+      const seen = new Set<string>();
+      for (const t of terms) {
+        if (ctxTerms.has(t) && !seen.has(t)) { overlap++; seen.add(t); }
+      }
+      // Relevance 0..1 (capped), value 0..~MAX. Combined so on-topic beats off-topic
+      // even at lower proven value, but proven value still matters as a tiebreak/multiplier.
+      const relevance = Math.min(1, overlap / 4);          // ~4 shared terms = fully relevant
+      const value     = l.confidence * Math.min(l.reinforced, 5) / 5; // 0..1
+      // Weight relevance higher than raw value so retrieval is context-driven.
+      const score = relevance * 0.7 + value * 0.3;
+      return { l, score, relevance };
+    });
+
+    // Only return learnings with at least some relevance; if none overlap, fall back
+    // to the proven top-N so KIRA isn't left with nothing.
+    const relevant = scored.filter(s => s.relevance > 0).sort((a, b) => b.score - a.score);
+    if (relevant.length === 0) return this.getCoreLearnings(limit);
+    return relevant.slice(0, limit).map(s => s.l);
+  }
+
+  // Context string built from relevance-weighted retrieval for a given decision context.
+  async getRelevantLearningsForContext(context: string): Promise<string> {
+    const learnings = await this.getRelevantLearnings(context, 6);
+    if (!learnings.length) return "No relevant learnings for this context.";
+    return learnings
+      .map(l => `${l.insight} (confidence ${(l.confidence * 100).toFixed(0)}%, seen ${l.reinforced}x)`)
+      .join(" | ");
+  }
+
+
   async getCoreLearningsForContext(): Promise<string> {
     const learnings = await this.getCoreLearnings(6);
     if (!learnings.length) return "No core learnings yet.";
