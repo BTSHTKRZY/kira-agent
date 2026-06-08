@@ -174,9 +174,15 @@ export class ToolRegistry {
     }
 
     // Restrict "registry" view to the registry we care about, on the right chain.
+    // NOTE: the live API returns registry_chain as a NUMERIC chain id ("8453" for Base),
+    // not the string "base". Accept both the numeric id and common string forms so the
+    // filter doesn't drop every tool (that bug returned a count of 0).
+    const CHAIN_ALIASES = new Set(
+      [REGISTRY_CHAIN.toLowerCase(), "8453", "base", "base-mainnet"]
+    );
     const onRegistry = tools.filter(t =>
       (!t.registryAddr || t.registryAddr === REGISTRY_ADDR) &&
-      (!t.registryChain || t.registryChain.toLowerCase() === REGISTRY_CHAIN.toLowerCase())
+      (!t.registryChain || CHAIN_ALIASES.has(t.registryChain.toLowerCase()))
     );
     const active = onRegistry.filter(t => t.isActive);
 
