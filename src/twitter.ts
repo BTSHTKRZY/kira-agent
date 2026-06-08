@@ -541,6 +541,9 @@ Only accounts KIRA would genuinely learn from. Respond ONLY with a JSON array of
       // On 402 (quota exhausted), log clearly so it's diagnosable.
       if (String(err?.message || "").includes("402") || err?.code === 402) {
         console.error("[Twitter] Search failed: 402 — X API quota/credits exhausted. Top up credits.");
+      } else if (String(err?.message || "").includes("400")) {
+        // Echo the EXACT query that 400'd so we can see what syntax is breaking it.
+        console.error(`[Twitter] Search 400 on query: <<${q}>> — ${err?.message}`);
       } else {
         console.error(`Search failed:`, err?.message);
       }
@@ -610,12 +613,16 @@ Respond ONLY with a JSON array of 3 plain keyword strings.`,
     return q
       .replace(/\b(filter|min_faves|min_replies|min_retweets|since|until|from|to|lang):\S+/gi, "")
       .replace(/-RT\b/gi, "")
-      .replace(/[()"]/g, "")
+      // Hyphens act as the NEGATION operator in X search ("ERC-8004" -> "ERC" minus "8004"),
+      // and stray colons/symbols can produce 400 Invalid Request. Replace hyphens between
+      // word chars with a space and strip other operator-significant punctuation.
+      .replace(/(\w)-(\w)/g, "$1 $2")     // ERC-8004 -> ERC 8004
+      .replace(/[()"#:~*]/g, " ")          // operator/symbol chars that break v2 search
       .replace(/\bOR\b/g, " ")
       .replace(/\s+/g, " ")
       .trim();
   }
-
+  
   // ── THREAD GENERATION ─────────────────────────────────────────────────────────
 
   async generateThread(topic: string, context: string): Promise<string[]> {
