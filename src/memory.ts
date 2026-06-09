@@ -5,7 +5,8 @@
 //   3. Relationship memory — who engages with KIRA, what resonates (accumulating)
 // This is KIRA's tacit-knowledge equivalent: lived experience, time-stamped.
 
-import { kiraRedis } from "./redis.js";
+import { kiraRedis }  from "./redis.js";
+import { kiraVector } from "./vectormemory.js";
 
 export interface JournalEntry {
   ts:        number;
@@ -94,6 +95,10 @@ export class KiraMemory {
       similar.evidence   = evidence;
       similar.ts         = Date.now();
       await kiraRedis.setJson(K.core(), existing);
+      // Refresh the semantic index for this learning (no-op if Vector disabled).
+      await kiraVector.upsertText("learnings", this.learningId(similar.insight),
+        `${similar.insight}. ${similar.evidence}`,
+        { confidence: similar.confidence, reinforced: similar.reinforced });
       return;
     }
 
@@ -102,6 +107,16 @@ export class KiraMemory {
       .sort((a, b) => (b.confidence * b.reinforced) - (a.confidence * a.reinforced))
       .slice(0, MAX_CORE);
     await kiraRedis.setJson(K.core(), updated);
+    // Index in Vector for semantic recall (no-op if Vector disabled).
+    await kiraVector.upsertText("learnings", this.learningId(insight),
+      `${insight}. ${evidence}`, { confidence, reinforced: 1 });
+  }
+
+  // Stable id for a learning's vector entry, derived from its insight text so
+  // reinforcement updates the same vector rather than creating duplicates.
+  private learningId(insight: string): string {
+    const slug = insight.toLowerCase().replace(/[^a-z0-9]+/g, "_").slice(0, 48);
+    return `learn_${slug}`;
   }
 
   async getCoreLearnings(limit: number = 10): Promise<CoreLearning[]> {
@@ -123,10 +138,27 @@ export class KiraMemory {
   // Honest note: this is lexical overlap, not semantic embeddings — it's a real,
   // measurable improvement over global top-N, but it's not deep understanding. A
   // future upgrade could use embeddings; this is the tractable, verifiable version.
+  // Honest note: the lexical path below is term-overlap, not deep understanding.
+  // When Upstash Vector is configured, we use SEMANTIC retrieval first (match by
+  // meaning, e.g. "Fed eased" ↔ "rate cut"), and fall back to the lexical path when
+  // Vector is disabled or returns nothing. This is the L2 upgrade the corpus needed.
   async getRelevantLearnings(context: string, limit: number = 6): Promise<CoreLearning[]> {
     const learnings = await kiraRedis.getJson<CoreLearning[]>(K.core()) || [];
     if (learnings.length === 0) return [];
 
+    // ── SEMANTIC PATH (preferred when Vector is enabled) ──
+    if (kiraVector.enabled() && context && context.trim()) {
+      const matches = await kiraVector.queryText("learnings", context, limit, 0.0);
+      if (matches.length > 0) {
+        // Map vector ids back to the authoritative Redis learnings.
+        const byId = new Map(learnings.map(l => [this.learningId(l.insight), l]));
+        const hits = matches.map(m => byId.get(m.id)).filter(Boolean) as CoreLearning[];
+        if (hits.length > 0) return hits.slice(0, limit);
+      }
+      // enabled but no usable hits → fall through to lexical
+    }
+
+    // ── LEXICAL FALLBACK (unchanged #8 logic) ──
     // Build a term set from the current decision context (lowercased words >3 chars).
     const ctxTerms = new Set(
       (context || "").toLowerCase().match(/[a-z0-9]{4,}/g) || []
