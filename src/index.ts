@@ -214,6 +214,7 @@ function isTooSimilarToRecent(candidate: string, recentPosts: string[], lookback
 interface KiraState {
   recentPosts:          string[];
   recentPostTopics:     string[];
+  recentActions:        string[];
   recentLearnings:      string[];
   knownWallets:         Record<string, string>;
   sessionStart:         number;
@@ -277,6 +278,7 @@ interface KiraState {
 const state: KiraState = {
   recentPosts:           [],
   recentPostTopics:      [],
+  recentActions:         [],
   recentLearnings:       [],
   knownWallets:          {},
   sessionStart:          Date.now(),
@@ -1169,6 +1171,7 @@ async function decide(context: string): Promise<Decision> {
   const minutesSinceLastPost   = state.lastPostTime > 0 ? Math.floor((Date.now() - state.lastPostTime) / 60000) : 999;
   const minutesSinceEngagement = state.lastEngagementTime > 0 ? Math.floor((Date.now() - state.lastEngagementTime) / 60000) : 999;
   const minutesSinceMention    = state.lastMentionCheck > 0 ? Math.floor((Date.now() - state.lastMentionCheck) / 60000) : 999;
+  const minutesSinceLastScan   = state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) : 999;
 
   try {
     const response = await anthropic.messages.create({
@@ -1274,6 +1277,35 @@ Respond ONLY with valid JSON:
     // Safety overrides
     if (!state.xApiAvailable && ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics"].includes(parsed.action))
       return { action: "sleep", content: "15", reasoning: "X API unavailable" };
+
+    // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
+    // PROBLEM OBSERVED: KIRA can get stuck choosing engage_topics cycle after cycle,
+    // each time rationalizing "haven't done this yet" though she just did. The theme
+    // rotation below only governs POST themes, not ACTION types — so engagement looped.
+    // FIX: if engage_topics has dominated recent actions, GENTLY redirect to a more
+    // valuable action that actually exercises her other capabilities (and the corpus):
+    // a market scan if one's due, else a research cycle if due, else fall through.
+    // This is a NUDGE, not a ban — engage_topics stays available; it's just down-weighted
+    // when over-used, so she rotates instead of looping. Deliberately conservative to
+    // avoid the opposite failure (thrashing / indecision).
+    {
+      const recent = state.recentActions.slice(-5);
+      const engageTopicsCount = recent.filter(a => a === "engage_topics").length;
+      if (parsed.action === "engage_topics" && engageTopicsCount >= 3) {
+        // Over-used. Prefer actions that use under-exercised capabilities.
+        if (minutesSinceLastScan >= 60) {
+          return { action: "scan_markets", content: "Rotating to market scan", reasoning: `Action rotation — engage_topics used ${engageTopicsCount}/5 recent cycles; exercising market analysis instead` };
+        }
+        if (await researchLoop.isDue()) {
+          return { action: "research_now", content: "Rotating to research", reasoning: `Action rotation — engage_topics over-used; running due research cycle instead` };
+        }
+        // If neither is available, allow ONE more engage_topics but force a longer
+        // pause after, so the loop slows rather than spins every 5 minutes.
+        if (engageTopicsCount >= 4) {
+          return { action: "observe", content: "Action variety pause", reasoning: `Action rotation — engage_topics used ${engageTopicsCount}/5 recent cycles and nothing else is due; brief observe to break the loop` };
+        }
+      }
+    }
 
     // Post limit rotation — when capped on posting, KIRA shifts to ENGAGEMENT and
     // RESEARCH rather than idling. Ladder ordered high-to-low so each rung is reachable.
@@ -1699,6 +1731,12 @@ async function kiraLoop(): Promise<void> {
     console.log(`Recent themes restored: ${savedThemes.slice(-4).join(", ")}`);
   }
 
+  // Restore recent ACTION types so the anti-loop rotation nudge survives restarts
+  const savedActions = await kiraRedis.getJson<string[]>("kira:recent_actions");
+  if (savedActions && savedActions.length) {
+    state.recentActions = savedActions;
+  }
+
   // Load KIRA's accumulated self-narrative — who he has become over time
   state.selfNarrative = await memory.getSelfNarrative();
   state.coreLearnings = await memory.getCoreLearningsForContext();
@@ -1812,6 +1850,12 @@ async function kiraLoop(): Promise<void> {
       const decision = await decide(context);
       console.log(`Decision: ${decision.action} — ${decision.content?.slice(0, 80)}`);
       if (decision.reasoning) console.log(`Reason: ${decision.reasoning}`);
+
+      // Track recent ACTION types (not just post themes) so the rotation nudge can
+      // detect and break action loops like repeated engage_topics.
+      state.recentActions.push(decision.action);
+      if (state.recentActions.length > 10) state.recentActions.shift();
+      await kiraRedis.setJson("kira:recent_actions", state.recentActions.slice(-10));
 
       await execute(decision);
 
