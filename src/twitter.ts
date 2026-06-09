@@ -686,18 +686,35 @@ OUTPUT FORMAT: respond with ONLY the tweet text — no preamble, no "Response:",
       console.error("[Twitter] BLOCKED outgoing text matching a secret pattern — not posting.");
       return false;
     }
-    // Phrase blocklist — known reasoning/scratchpad leaks.
-    const leakMarkers = [
-      "looking at this", "looking at @", "the rest of my context",
-      "**response:**", "response:", "reply:", "i could ask", "feels like fishing",
-      "nothing urgent demanding", "no crisis requiring", "shows normal operations",
-      "the engagement would be", "rather than broadcast", "my context shows",
-      "let's engage", "lets engage", "i'll respond", "i will respond", "i should reply",
-      "worth engaging", "i'll reply", "i should engage", "let me engage", "let me reply",
-      "decision:", "reasoning:", "my response would be", "here's my reply", "heres my reply",
-      "i'll engage", "no compelling", "engagement cooldown", "scan cooldown",
+    // Reasoning/scratchpad-leak detection.
+    // PRIOR BUG: this used t.includes(marker) with short generic fragments
+    // ("response:", "reply:", "decision:", "reasoning:", "no compelling",
+    // "worth engaging", ...). Those match legitimate posts mid-sentence and
+    // silenced real content (e.g. a genuine "Shadow learning status: ..." post).
+    // FIX: real scratchpad leaks appear at the START of the text (the model
+    // prefixing its reasoning) or as the model's planning voice. So we anchor
+    // leak markers to the beginning rather than matching anywhere. Phrases that
+    // are unambiguous leaks regardless of position are kept in a small strict list.
+
+    // (a) Leaked-prefix markers — only caught when they LEAD the text.
+    const leadLeakMarkers = [
+      "looking at this", "looking at @", "response:", "**response:**", "reply:",
+      "my response would be", "here's my reply", "heres my reply",
+      "decision:", "reasoning:", "i could ask", "let's engage", "lets engage",
+      "i'll respond", "i will respond", "i should reply", "i'll reply",
+      "i should engage", "let me engage", "let me reply", "i'll engage",
     ];
-    if (leakMarkers.some(m => t.includes(m))) return false;
+    if (leadLeakMarkers.some(m => t.startsWith(m))) return false;
+
+    // (b) Unambiguous internal-monologue phrases — rare enough in real posts that
+    // matching anywhere is safe. Kept deliberately specific (no bare words).
+    const strictLeakMarkers = [
+      "the rest of my context", "my context shows", "feels like fishing",
+      "nothing urgent demanding", "no crisis requiring", "shows normal operations",
+      "the engagement would be", "rather than broadcast",
+      "engagement cooldown", "scan cooldown",
+    ];
+    if (strictLeakMarkers.some(m => t.includes(m))) return false;
     // Any standalone/leading/trailing SKIP.
     if (/(^|\s)skip(\s|$|\.)/i.test(raw) && raw.length < 400) return false;
     // General reasoning-shape: starts with first-person planning verbs.
