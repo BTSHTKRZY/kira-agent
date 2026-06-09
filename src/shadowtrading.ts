@@ -26,6 +26,7 @@ export interface ShadowPosition {
   // resolve the shadow or move weights; purely lets us watch learning forming early.
   interimPnlPct?: number;
   interimTime?:   number;
+  gradeNote?:     string;   // optional note, e.g. why a shadow was excluded from learning
 }
 
 export interface SignalPerformance {
@@ -47,12 +48,29 @@ const K = {
 const DEFAULT_HORIZON_DAYS = 7;
 const MAX_SHADOWS = 500;
 
+// A short-horizon (2–7d) move beyond ±500% on a tracked asset is, in practice,
+// a data artifact (mis-scaled or near-zero entry price, decimals mismatch) rather
+// than a real price move. We compute P&L defensively and exclude implausible values
+// from learning so a single corrupted entry price can't poison signal stats.
+// (This is what produced the bogus ~27,000% averages on NFT signals.)
+const MAX_PLAUSIBLE_ABS_PNL_PCT = 500;
+
 export class KiraShadowTrading {
 
   private async nextId(): Promise<string> {
     const n = parseInt(await kiraRedis.get(K.counter()) || "0") + 1;
     await kiraRedis.set(K.counter(), String(n));
     return `S${String(n).padStart(5, "0")}`;
+  }
+
+  // Defensive P&L: returns null when entry price is missing/tiny or the resulting
+  // move is implausibly large (corrupted entry). Callers must skip null values.
+  private safePnlPct(entryPrice: number, currentPrice: number): number | null {
+    if (!Number.isFinite(entryPrice) || !Number.isFinite(currentPrice)) return null;
+    if (entryPrice <= 1e-9 || currentPrice <= 0) return null;
+    const pnl = ((currentPrice - entryPrice) / entryPrice) * 100;
+    if (!Number.isFinite(pnl) || Math.abs(pnl) > MAX_PLAUSIBLE_ABS_PNL_PCT) return null;
+    return pnl;
   }
 
   // Record a shadow position for ANY scored item (called during market scan)
@@ -122,9 +140,22 @@ export class KiraShadowTrading {
         continue;
       }
 
+      const pnl = this.safePnlPct(shadow.entryPrice, currentPrice);
+      if (pnl === null) {
+        // Corrupted/implausible entry price — resolve and remove WITHOUT attributing
+        // to signals, so one bad data point can't poison weight-learning.
+        shadow.checkedPrice = currentPrice;
+        shadow.checkedTime  = Date.now();
+        shadow.resolved     = true;
+        shadow.gradeNote    = "excluded: implausible P&L (bad entry price)";
+        await kiraRedis.setJson(K.shadow(id), shadow);
+        await kiraRedis.srem(K.shadows(), id);
+        continue;
+      }
+
       shadow.checkedPrice = currentPrice;
       shadow.checkedTime  = Date.now();
-      shadow.pnlPct       = ((currentPrice - shadow.entryPrice) / shadow.entryPrice) * 100;
+      shadow.pnlPct       = pnl;
       shadow.resolved     = true;
       await kiraRedis.setJson(K.shadow(id), shadow);
       await kiraRedis.srem(K.shadows(), id);
@@ -169,7 +200,8 @@ export class KiraShadowTrading {
       } catch {}
       if (price <= 0) continue;
 
-      const interimPnl = ((price - shadow.entryPrice) / shadow.entryPrice) * 100;
+      const interimPnl = this.safePnlPct(shadow.entryPrice, price);
+      if (interimPnl === null) continue;  // corrupted/implausible entry — exclude from learning
       shadow.interimPnlPct = interimPnl;
       shadow.interimTime   = Date.now();
       await kiraRedis.setJson(K.shadow(id), shadow);
