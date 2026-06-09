@@ -673,9 +673,12 @@ OUTPUT FORMAT: respond with ONLY the tweet text — no preamble, no "Response:",
     // S2 SECRET OUTPUT FILTER (hard backstop): never let anything secret-shaped go out.
     // Keys are never in KIRA's context by design, so this should never fire — it exists
     // as defense-in-depth in case a secret ever reaches an output path.
+    // NOTE: the old "12/24-word mnemonic shape" regex (/\b([a-z]+\s+){11,23}[a-z]+\b/i)
+    // was REMOVED — it matched any 12+ word lowercase sentence and silenced legitimate
+    // replies. A real seed phrase has a far more specific signature than "long sentence";
+    // the precise patterns below catch actual key/secret shapes without false positives.
     const secretPatterns: RegExp[] = [
       /0x[a-f0-9]{64}\b/i,                          // 32-byte hex (private key shape)
-      /\b([a-z]+\s+){11,23}[a-z]+\b/i,              // 12/24-word mnemonic shape (long all-lowercase word run)
       /\b(sk|pk|api[_-]?key|secret|seed phrase|mnemonic|private key)\b[:=]\s*\S+/i,
       /\b(BASE_RPC|ETH_RPC|OPENSEA_API_KEY|KIRA_PRIVATE_KEY|ANTHROPIC_API_KEY|UPSTASH|REDIS_URL)\b/i,
     ];
