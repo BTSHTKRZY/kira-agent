@@ -32,6 +32,7 @@ import { KiraSpendLimit } from "./spendlimit.js";
 import { KiraAgentNetwork } from "./agentnetwork.js";
 import { KiraA2A } from "./a2a.js";
 import { KiraResearchLoop } from "./research_loop.js";
+import { KiraKnowledge } from "./knowledge.js";
 import { sendEmail, weeklyReportEmail, tradeAlertEmail, alertEmail } from "./email.js";
 import { kiraRedis } from "./redis.js";
 
@@ -245,6 +246,7 @@ interface KiraState {
   lastShadowResolve:    number;
   selfNarrative:        string;
   coreLearnings:        string;
+  corpusKnowledge:      string;
   relationships:        string;
   shadowSummary:        string;
   a2aSummary:           string;
@@ -307,6 +309,7 @@ const state: KiraState = {
   lastShadowResolve:     0,
   selfNarrative:         "",
   coreLearnings:         "",
+  corpusKnowledge:       "",
   relationships:         "",
   shadowSummary:         "",
   a2aSummary:            "",
@@ -365,6 +368,7 @@ const spendLimit       = new KiraSpendLimit();
 const agentNetwork     = new KiraAgentNetwork();
 const a2a              = new KiraA2A();
 const researchLoop     = new KiraResearchLoop(memory);
+const knowledge        = new KiraKnowledge();
 
 function sleep(ms: number): Promise<void> {
   return new Promise(r => setTimeout(r, ms));
@@ -1100,6 +1104,9 @@ async function backgroundTasks(): Promise<void> {
       state.crossChainSummary || "",
     ].join(" ");
     state.coreLearnings = await memory.getRelevantLearningsForContext(relevanceContext);
+    // L2: retrieve corpus knowledge semantically relevant to this decision context.
+    // L3: this call also records which knowledge items fed the decision (instrumentation).
+    state.corpusKnowledge = await knowledge.getRelevantKnowledgeForContext(relevanceContext, "main_cycle");
   }
   state.relationships = await memory.getRelationshipsForContext();
   state.shadowSummary = await shadowTrading.formatForContext();
@@ -1197,6 +1204,9 @@ ${state.selfNarrative || "Newly awakened."}
 
 CORE LEARNINGS (validated over time, weight these heavily):
 ${state.coreLearnings || "none yet"}
+
+CORPUS KNOWLEDGE (structured market/protocol knowledge relevant to right now — use it to reason, not to recite):
+${state.corpusKnowledge || "none retrieved"}
 
 KEY RELATIONSHIPS (people KIRA knows):
 ${state.relationships || "none yet"}
@@ -1644,6 +1654,7 @@ async function kiraLoop(): Promise<void> {
 
   await scoring.loadWeights();
   await research.seedBasePatterns();
+  await knowledge.seedLibrary();   // L1+L2: structured knowledge corpus, semantically indexed
   await smartMoney.seedWallets();
   await smartMoney.ingestFromAgentCheck();
   await multiAgent.discoverAgents();
