@@ -45,6 +45,43 @@ const SCOUT_QUERIES = [
   "ERC-6551 token bound account agents",
 ];
 
+// #11 (refinement): capabilities KIRA ALREADY has. Findings whose "needs_code" really
+// maps to one of these are NOT escalated — otherwise she keeps recommending things she
+// can already do (e.g. "query the ERC-8257 registry / discover tools" — she does this
+// every cycle via toolregistry.ts). Each entry is a set of lowercase signal phrases;
+// if a finding's title+summary+action matches, the capability is considered PRESENT.
+// Keep in sync as KIRA gains capabilities (e.g. add x402/tool-invocation once #12 ships).
+const EXISTING_CAPABILITIES: Array<{ name: string; signals: string[] }> = [
+  { name: "erc8257-registry-read", signals: ["query the erc-8257 registry", "read the registry", "discover available tools", "tool discovery", "parse tool metadata", "registry contract", "list tools", "search tools", "discover and integrate"] },
+  { name: "erc8004-agent-discovery", signals: ["erc-8004 registry", "agent identity registry", "discover agents", "awakened normie", "agent directory"] },
+  { name: "market-scan-scoring", signals: ["scan nft", "score collections", "floor price", "scan markets", "watchlist"] },
+  { name: "x-engagement", signals: ["post to x", "reply to mentions", "engage on twitter", "social engagement"] },
+  { name: "research-loop", signals: ["scout x and web", "research developments", "distill findings"] },
+];
+
+function matchesExistingCapability(text: string): string | null {
+  const t = text.toLowerCase();
+  for (const cap of EXISTING_CAPABILITIES) {
+    if (cap.signals.some(s => t.includes(s))) return cap.name;
+  }
+  return null;
+}
+
+// Normalize a title/summary into a dedup key: lowercase, strip punctuation/numbers,
+// drop filler words, keep the salient tokens sorted. Catches near-duplicates like
+// "ERC-8257 ... Active Adoption" vs "ERC-8257 ... Active Registrations".
+function dedupKey(s: string): string {
+  const stop = new Set(["the","a","an","and","or","of","for","to","in","on","is","are","active","new","update","updates","onchain"]);
+  return s.toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\d+/g, " ")
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !stop.has(w))
+    .slice(0, 6)
+    .sort()
+    .join(" ");
+}
+
 export interface Finding {
   id:          string;
   source:      string;       // url or query origin
@@ -203,6 +240,13 @@ export class KiraResearchLoop {
 
       // STAGE 6: RECOMMEND — build recs for needs-code findings
       for (const f of findings.filter(x => x.actionable === "needs_code")) {
+        // #11 refinement: skip findings that map to a capability KIRA ALREADY has,
+        // so she stops recommending things she can already do.
+        const have = matchesExistingCapability(`${f.title} ${f.summary} ${f.action}`);
+        if (have) {
+          console.log(`[Research] Gap suppressed — already have capability "${have}" for: ${f.title.slice(0, 50)}`);
+          continue;
+        }
         const rec = await this.makeBuildRec(f);
         if (rec) buildRecs.push(rec);
       }
@@ -312,9 +356,13 @@ Respond ONLY with JSON:
   }
 
   private async makeBuildRec(f: Finding): Promise<BuildRec | null> {
-    // De-dupe against existing recs
+    // De-dupe against existing recs using a normalized key (catches near-duplicates
+    // that differ only in trailing words/numbers, e.g. "...Active Adoption" vs
+    // "...Active Registrations").
     const existing = await kiraRedis.getJson<BuildRec[]>(K.buildRecs()) || [];
-    if (existing.some(r => r.title.toLowerCase().slice(0, 40) === f.title.toLowerCase().slice(0, 40))) {
+    const key = dedupKey(f.title);
+    if (key && existing.some(r => dedupKey(r.title) === key)) {
+      console.log(`[Research] Build-rec deduped (near-duplicate of prior): ${f.title.slice(0, 50)}`);
       return null;
     }
     const rec: BuildRec = {
@@ -375,6 +423,18 @@ Respond ONLY with JSON:
 
   private async sendBuildRecs(recs: BuildRec[]): Promise<void> {
     try {
+      // Collapse near-duplicates within this same batch (keep highest priority).
+      const prio = (p: string) => (p === "high" ? 3 : p === "medium" ? 2 : 1);
+      const byKey = new Map<string, BuildRec>();
+      for (const r of recs) {
+        const k = dedupKey(r.title) || r.id;
+        const prev = byKey.get(k);
+        if (!prev || prio(r.priority) > prio(prev.priority)) byKey.set(k, r);
+      }
+      const deduped = [...byKey.values()];
+      if (deduped.length === 0) return;
+      recs = deduped;
+
       const body = [
         "KIRA — Autonomous Research: Build Recommendations",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
