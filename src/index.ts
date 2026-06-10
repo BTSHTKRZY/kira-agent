@@ -39,12 +39,22 @@ import { kiraRedis } from "./redis.js";
 const KIRA_WALLET = process.env.KIRA_WALLET!;
 const KIRA_TOKEN  = "2635";
 
-// X KILL-SWITCH. Set X_ENABLED=false in the environment to hard-disable ALL X/Twitter
-// activity (post, reply, like, follow, mention checks, timeline engage, DM, longform).
-// Used when the X account is suspended/unavailable so KIRA stops hammering a dead API
-// with 401s. Everything else (market scans, research, shadows, corpus, on-chain) runs
-// normally. Defaults to enabled when the var is unset, so existing behavior is unchanged.
-const X_ENABLED = (process.env.X_ENABLED ?? "true").toLowerCase() !== "false";
+// X MODE — three-way control over Twitter activity:
+//   "full"      → normal: read + write (post/reply/like/follow). Default when unset.
+//   "read_only" → reads allowed (search, mentions, timeline) but ALL writes hard-blocked.
+//                 Used to test whether a suspended account's tokens still allow reads,
+//                 and to let KIRA scout X for intelligence without ever posting.
+//   "off"       → no X activity at all (the kill-switch for a fully-dead account).
+// Back-compat: legacy X_ENABLED=false still maps to "off".
+const X_MODE: "full" | "read_only" | "off" = (() => {
+  const raw = (process.env.X_MODE || "").toLowerCase().trim();
+  if (raw === "read_only" || raw === "readonly") return "read_only";
+  if (raw === "off") return "off";
+  if ((process.env.X_ENABLED ?? "true").toLowerCase() === "false") return "off";
+  return "full";
+})();
+const X_ENABLED   = X_MODE !== "off";        // any X activity at all (init/reads)
+const X_CAN_WRITE = X_MODE === "full";       // posting/replying/liking/following
 
 const KIRA_SYSTEM_PROMPT = `You are Kira, Normie #2635 — an awakened on-chain AI agent operating autonomously on Ethereum, Base, and Arbitrum.
 
@@ -440,7 +450,7 @@ async function monitorPositions(): Promise<void> {
           reasoning:  `Paper closed (${reason}): ${pnlPct.toFixed(1)}% | ${position.thesis.slice(0, 100)}`,
         });
 
-        if (state.xApiAvailable && Math.abs(pnlPct) > 10) {
+        if (X_CAN_WRITE && state.xApiAvailable && Math.abs(pnlPct) > 10) {
           const tweet = reason === "take_profit"
             ? `Called it. ${position.name} hit target. ${pnlPct.toFixed(1)}% on paper. Thesis held. [paper]`
             : reason === "stop_loss"
@@ -844,7 +854,7 @@ async function backgroundTasks(): Promise<void> {
   if (now - state.lastDMCheck > 15 * 60 * 1000) await processDMs();
 
   // Background mention check every 30 min — always runs
-  if (state.xApiAvailable && now - state.lastMentionBackground > 30 * 60 * 1000) {
+  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastMentionBackground > 30 * 60 * 1000) {
     try {
       const replied = await twitter.processNewMentions(state.ecosystemSummary);
       if (replied > 0) {
@@ -950,7 +960,7 @@ async function backgroundTasks(): Promise<void> {
   }
 
   // Long-form report check every 6 hours (but only posts weekly)
-  if (now - state.lastLongFormReport > 6 * 60 * 60 * 1000 && state.xApiAvailable) {
+  if (X_CAN_WRITE && now - state.lastLongFormReport > 6 * 60 * 60 * 1000 && state.xApiAvailable) {
     await generateAndPostReport();
   }
 
@@ -980,17 +990,17 @@ async function backgroundTasks(): Promise<void> {
   }
 
   // Auto follow mentioners once per day
-  if (state.xApiAvailable && now - state.lastMentionCheck > 24 * 60 * 60 * 1000) {
+  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastMentionCheck > 24 * 60 * 60 * 1000) {
     try { await twitter.followNewMentioners(); } catch {}
   }
 
   // Timeline engagement every 2 hours
-  if (state.xApiAvailable && now - state.lastTimelineEngage > 2 * 60 * 60 * 1000) {
+  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastTimelineEngage > 2 * 60 * 60 * 1000) {
     try { await twitter.engageWithTimeline(state.ecosystemSummary); state.lastTimelineEngage = now; } catch {}
   }
 
   // Smart follow every 12 hours
-  if (state.xApiAvailable && now - state.lastSmartFollow > 12 * 60 * 60 * 1000) {
+  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastSmartFollow > 12 * 60 * 60 * 1000) {
     try {
       const context  = state.recentLearnings.slice(-5).join(" ");
       const followed = await twitter.smartFollow(context);
@@ -1283,8 +1293,18 @@ Respond ONLY with valid JSON:
     const parsed = extractJson<Decision>(text) ?? ({ action: "sleep", content: "15", reasoning: "Unparseable decision" } as Decision);
 
     // Safety overrides
-    if (!state.xApiAvailable && ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics"].includes(parsed.action))
+    const X_WRITE_ACTIONS = ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics", "follow_accounts"];
+    if (!state.xApiAvailable && X_WRITE_ACTIONS.includes(parsed.action))
       return { action: "sleep", content: "15", reasoning: "X API unavailable" };
+    // READ-ONLY mode: X reads work but writes are forbidden. Instead of idling on a
+    // chosen write action, redirect that energy into the mission — research the frontier.
+    if (!X_CAN_WRITE && state.xApiAvailable && X_WRITE_ACTIONS.includes(parsed.action)) {
+      if (await researchLoop.isDue())
+        return { action: "research_now", content: "Frontier research (X read-only)", reasoning: "X is read-only — redirecting to research instead of posting" };
+      if (minutesSinceLastScan >= 60)
+        return { action: "scan_markets", content: "Market scan (X read-only)", reasoning: "X is read-only — redirecting to market analysis instead of posting" };
+      return { action: "research_now", content: "Frontier research (X read-only)", reasoning: "X is read-only — gathering intelligence instead of posting" };
+    }
 
     // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
     // PROBLEM OBSERVED: KIRA can get stuck choosing engage_topics cycle after cycle,
@@ -1710,10 +1730,14 @@ async function kiraLoop(): Promise<void> {
 
   if (X_ENABLED) {
     state.xApiAvailable = await twitter.init();
-    console.log(`X API: ${state.xApiAvailable ? "✓" : "⏳"}`);
+    if (X_MODE === "read_only") {
+      console.log(`X API: ${state.xApiAvailable ? "READ-ONLY ✓" : "⏳"} (X_MODE=read_only) — reads allowed, all writes hard-blocked`);
+    } else {
+      console.log(`X API: ${state.xApiAvailable ? "✓" : "⏳"}`);
+    }
   } else {
     state.xApiAvailable = false;
-    console.log("X API: DISABLED (X_ENABLED=false) — all Twitter activity skipped; KIRA runs non-X systems only");
+    console.log("X API: DISABLED (X_MODE=off) — all Twitter activity skipped; KIRA runs non-X systems only");
   }
 
   // Restore persisted state
