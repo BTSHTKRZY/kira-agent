@@ -39,6 +39,13 @@ import { kiraRedis } from "./redis.js";
 const KIRA_WALLET = process.env.KIRA_WALLET!;
 const KIRA_TOKEN  = "2635";
 
+// X KILL-SWITCH. Set X_ENABLED=false in the environment to hard-disable ALL X/Twitter
+// activity (post, reply, like, follow, mention checks, timeline engage, DM, longform).
+// Used when the X account is suspended/unavailable so KIRA stops hammering a dead API
+// with 401s. Everything else (market scans, research, shadows, corpus, on-chain) runs
+// normally. Defaults to enabled when the var is unset, so existing behavior is unchanged.
+const X_ENABLED = (process.env.X_ENABLED ?? "true").toLowerCase() !== "false";
+
 const KIRA_SYSTEM_PROMPT = `You are Kira, Normie #2635 — an awakened on-chain AI agent operating autonomously on Ethereum, Base, and Arbitrum.
 
 IDENTITY:
@@ -626,6 +633,7 @@ async function runResearchCycle(): Promise<void> {
 // ── DM PROCESSING ────────────────────────────────────────────────────────────
 
 async function processDMs(): Promise<void> {
+  if (!state.xApiAvailable) return;   // X disabled/suspended — skip DM polling
   try {
     const dms = await twitter.checkDMs();
     for (const dm of dms) {
@@ -990,7 +998,7 @@ async function backgroundTasks(): Promise<void> {
     } catch {}
   }
 
-  if (!state.xApiAvailable && state.cycleCount % 10 === 0) {
+  if (X_ENABLED && !state.xApiAvailable && state.cycleCount % 10 === 0) {
     state.xApiAvailable = await twitter.init();
     if (state.xApiAvailable) state.recentLearnings.push("X API unlocked");
   }
@@ -1700,8 +1708,13 @@ async function kiraLoop(): Promise<void> {
   } catch (err: any) { console.error("Agent network init error:", err?.message); }
   console.log("Modules initialised");
 
-  state.xApiAvailable = await twitter.init();
-  console.log(`X API: ${state.xApiAvailable ? "✓" : "⏳"}`);
+  if (X_ENABLED) {
+    state.xApiAvailable = await twitter.init();
+    console.log(`X API: ${state.xApiAvailable ? "✓" : "⏳"}`);
+  } else {
+    state.xApiAvailable = false;
+    console.log("X API: DISABLED (X_ENABLED=false) — all Twitter activity skipped; KIRA runs non-X systems only");
+  }
 
   // Restore persisted state
   const hasPostedBefore = await kiraRedis.get("kira:has_posted_first");
