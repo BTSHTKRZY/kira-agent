@@ -33,6 +33,7 @@ import { KiraAgentNetwork } from "./agentnetwork.js";
 import { KiraA2A } from "./a2a.js";
 import { KiraResearchLoop } from "./research_loop.js";
 import { KiraKnowledge } from "./knowledge.js";
+import { webSearchClient, WEB_SEARCH_ENABLED } from "./websearch.js";
 import { sendEmail, weeklyReportEmail, tradeAlertEmail, alertEmail } from "./email.js";
 import { kiraRedis } from "./redis.js";
 
@@ -250,6 +251,7 @@ interface KiraState {
   lastEmailCheck:       number;
   lastResearchCheck:    number;
   lastWeeklyReport:     number;
+  lastResearchDigest:   number;
   lastPostTime:         number;
   lastEngagementTime:   number;
   lastTimelineEngage:   number;
@@ -314,6 +316,7 @@ const state: KiraState = {
   lastEmailCheck:        0,
   lastResearchCheck:     0,
   lastWeeklyReport:      0,
+  lastResearchDigest:    0,
   lastPostTime:          0,
   lastEngagementTime:    0,
   lastTimelineEngage:    0,
@@ -739,6 +742,51 @@ async function scanOnChainEvents(): Promise<void> {
   state.lastOnChainScan = Date.now();
 }
 
+// ── DAILY RESEARCH DIGEST ─────────────────────────────────────────────────────
+// Once-daily summary of KIRA's frontier intelligence work: what she's been scouting,
+// what she ingested into her corpus, and her web-search budget. This is the "heads-down
+// research mode" output channel that replaces X as the way KIRA surfaces what she learns.
+async function sendResearchDigest(): Promise<void> {
+  try {
+    const corpusReport = await knowledge.usageReport(8);
+    const allItems     = await knowledge.getAllItems();
+    const ingested     = allItems.filter(i => i.source === "ingested");
+    const recentIngest = ingested.sort((a, b) => b.addedAt - a.addedAt).slice(0, 6);
+    const ws           = await webSearchClient.usage();
+    const researchCtx  = await researchLoop.formatForContext();
+
+    const lines: string[] = [];
+    lines.push("KIRA — Daily Frontier Intelligence Digest");
+    lines.push("=".repeat(44));
+    lines.push("");
+    lines.push(`Mode: heads-down research (X ${X_CAN_WRITE ? "live" : "unavailable"}). KIRA is scouting the agentic/on-chain-AI frontier and growing her knowledge corpus.`);
+    lines.push("");
+    lines.push("RECENT RESEARCH:");
+    lines.push(researchCtx || "  (no research summary yet)");
+    lines.push("");
+    lines.push(`CORPUS: ${allItems.length} items total, ${ingested.length} self-ingested from research.`);
+    if (recentIngest.length) {
+      lines.push("  Recently ingested:");
+      for (const it of recentIngest) lines.push(`   • [${it.domain}] ${it.title}`);
+    }
+    lines.push("");
+    lines.push(`  ${corpusReport}`);
+    lines.push("");
+    if (WEB_SEARCH_ENABLED) {
+      lines.push(`WEB SEARCH BUDGET: ${ws.used}/${ws.ceiling} queries used this month (${ws.remaining} remaining, free tier).`);
+    } else {
+      lines.push("WEB SEARCH: disabled (no BRAVE_SEARCH_API_KEY) — research running on on-chain sources only.");
+    }
+    lines.push("");
+    lines.push("Build recommendations (if any) are sent separately as they're found.");
+
+    await sendEmail("KIRA — Daily Frontier Digest", lines.join("\n"));
+    state.lastResearchDigest = Date.now();
+    await kiraRedis.set("kira:last_research_digest", String(state.lastResearchDigest));
+    console.log("[Digest] Daily research digest sent");
+  } catch (err: any) { console.error("Research digest error:", err?.message); }
+}
+
 // ── WEEKLY REPORT ─────────────────────────────────────────────────────────────
 
 async function sendWeeklyReport(): Promise<void> {
@@ -977,6 +1025,9 @@ async function backgroundTasks(): Promise<void> {
   // Weekly report
   if (now - state.lastWeeklyReport > 7 * 24 * 60 * 60 * 1000) await sendWeeklyReport();
 
+  // Daily frontier-intelligence digest (the heads-down research-mode output channel)
+  if (now - state.lastResearchDigest > 24 * 60 * 60 * 1000) await sendResearchDigest();
+
   // Monthly learning review
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
   if (state.cycleCount > 100 && (state.lastLearningReview === 0 || now - state.lastLearningReview > oneMonth)) {
@@ -1016,44 +1067,54 @@ async function backgroundTasks(): Promise<void> {
   // AUTONOMOUS RESEARCH LOOP — the self-improvement centerpiece (every ~6h)
   if (await researchLoop.isDue()) {
     try {
+      const xReadable = X_CAN_WRITE && state.xApiAvailable;  // X reads only usable when account is live
       const result = await researchLoop.runCycle({
-        // Web search: KIRA has no dedicated web-search API. Use X search as the
-        // scouting surface (rich for agent/crypto discourse) and treat tweet links
-        // as candidate sources. Returns search-result-shaped objects.
+        // Web search: REAL open-web search via Brave (websearch.ts). Falls back to []
+        // when no key / monthly ceiling hit; the loop then leans on on-chain sources.
+        // This replaces the old X-search-in-disguise that died with the X suspension.
         webSearch: async (query: string) => {
-          const tweets = await twitter.searchTweets(query, 8);
-          return tweets.map(t => ({
-            title:   (t.text || "").slice(0, 80),
-            url:     `https://x.com/i/web/status/${t.id}`,
-            snippet: t.text || "",
-          }));
+          const results = await webSearchClient.search(query, 8);
+          if (results.length > 0) return results;
+          // Fallback: if web search is unavailable AND X is readable, use X. Otherwise [].
+          if (xReadable) {
+            try {
+              const tweets = await twitter.searchTweets(query, 8);
+              return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
+            } catch { return []; }
+          }
+          return [];
         },
-        // Web fetch: real, via the docs reader (readArbitraryUrl strips HTML).
+        // Web fetch: real, via the docs reader (readArbitraryUrl strips HTML). Always available.
         webFetch: async (url: string) => {
           try { return await docs.readArbitraryUrl(url); } catch { return ""; }
         },
-        // X search: native.
-        xSearch: async (query: string) => {
-          const tweets = await twitter.searchTweets(query, 8);
-          return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
-        },
-        // Real external links shared in tweets — KIRA reads the actual articles/repos.
-        xLinks: async (query: string) => {
-          const tweets = await twitter.searchTweets(query, 10);
-          return twitter.extractUrls(tweets);
-        },
-        // High-signal accounts KIRA follows (frontier agent/infra voices).
-        signalAccounts: () => [
-          "CodinCowboy", "AxiomBot", "serc1n", "YigitDuman", "OnchainDataNerd",
-          "lookonchain", "DefiIgnas", "punk6529", "0xAlexKorn",
-        ],
+        // X reads are passed ONLY when the X account is live & writable. When suspended/off,
+        // these are omitted entirely so the loop never fires dead 401 calls.
+        ...(xReadable ? {
+          xSearch: async (query: string) => {
+            const tweets = await twitter.searchTweets(query, 8);
+            return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
+          },
+          xLinks: async (query: string) => {
+            const tweets = await twitter.searchTweets(query, 10);
+            return twitter.extractUrls(tweets);
+          },
+          signalAccounts: () => [
+            "CodinCowboy", "AxiomBot", "serc1n", "YigitDuman", "OnchainDataNerd",
+            "lookonchain", "DefiIgnas", "punk6529", "0xAlexKorn",
+          ],
+        } : {}),
         // Mine recent learnings for follow-up search terms KIRA already cares about.
         learningTerms: async () => {
           const learnings = await memory.getCoreLearnings(6);
-          // Use each learning's short insight as a search seed (first ~5 words)
           return learnings
             .map(l => (l.insight || "").split(/\s+/).slice(0, 5).join(" "))
             .filter(t => t.length > 8);
+        },
+        // CORPUS GROWTH: durable protocol/standard discoveries become permanent knowledge,
+        // so KIRA's understanding of the ecosystem compounds over time.
+        ingestToCorpus: async (domain: string, title: string, body: string) => {
+          await knowledge.addItem(domain as any, title, body, "ingested", 0.55);
         },
       });
       state.researchSummary  = await researchLoop.formatForContext();
@@ -1294,16 +1355,19 @@ Respond ONLY with valid JSON:
 
     // Safety overrides
     const X_WRITE_ACTIONS = ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics", "follow_accounts"];
-    if (!state.xApiAvailable && X_WRITE_ACTIONS.includes(parsed.action))
-      return { action: "sleep", content: "15", reasoning: "X API unavailable" };
-    // READ-ONLY mode: X reads work but writes are forbidden. Instead of idling on a
-    // chosen write action, redirect that energy into the mission — research the frontier.
-    if (!X_CAN_WRITE && state.xApiAvailable && X_WRITE_ACTIONS.includes(parsed.action)) {
+    // When KIRA can't write to X (suspended/off OR read-only), don't waste the cycle
+    // sleeping. Redirect that energy into the actual mission: research the agentic/on-chain
+    // frontier, or analyze markets. This is the "heads-down research mode" — KIRA keeps
+    // working toward the north star even with no social output channel.
+    if (!X_CAN_WRITE && X_WRITE_ACTIONS.includes(parsed.action)) {
+      const modeNote = state.xApiAvailable ? "X read-only" : "X unavailable";
       if (await researchLoop.isDue())
-        return { action: "research_now", content: "Frontier research (X read-only)", reasoning: "X is read-only — redirecting to research instead of posting" };
+        return { action: "research_now", content: `Frontier research (${modeNote})`, reasoning: `${modeNote} — redirecting to frontier research instead of posting` };
       if (minutesSinceLastScan >= 60)
-        return { action: "scan_markets", content: "Market scan (X read-only)", reasoning: "X is read-only — redirecting to market analysis instead of posting" };
-      return { action: "research_now", content: "Frontier research (X read-only)", reasoning: "X is read-only — gathering intelligence instead of posting" };
+        return { action: "scan_markets", content: `Market scan (${modeNote})`, reasoning: `${modeNote} — redirecting to market analysis instead of posting` };
+      // Neither due right now — do a short observe rather than a long idle sleep, so the
+      // next cycle comes around quickly to pick up research/scan when they become due.
+      return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — nothing due this moment; brief observe, will research/scan when due` };
     }
 
     // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
@@ -1598,24 +1662,37 @@ async function execute(decision: Decision): Promise<void> {
           // queue frontier posts, email build-recs). This is the centerpiece working
           // in KIRA's idle windows instead of sleeping.
           if (await researchLoop.isDue()) {
+            const xReadable2 = X_CAN_WRITE && state.xApiAvailable;
             const result = await researchLoop.runCycle({
               webSearch: async (query: string) => {
-                const tweets = await twitter.searchTweets(query, 8);
-                return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
+                const results = await webSearchClient.search(query, 8);
+                if (results.length > 0) return results;
+                if (xReadable2) {
+                  try {
+                    const tweets = await twitter.searchTweets(query, 8);
+                    return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
+                  } catch { return []; }
+                }
+                return [];
               },
               webFetch: async (url: string) => { try { return await docs.readArbitraryUrl(url); } catch { return ""; } },
-              xSearch: async (query: string) => {
-                const tweets = await twitter.searchTweets(query, 8);
-                return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
-              },
-              xLinks: async (query: string) => {
-                const tweets = await twitter.searchTweets(query, 10);
-                return twitter.extractUrls(tweets);
-              },
-              signalAccounts: () => ["CodinCowboy","AxiomBot","serc1n","YigitDuman","OnchainDataNerd","lookonchain","DefiIgnas","punk6529","0xAlexKorn"],
+              ...(xReadable2 ? {
+                xSearch: async (query: string) => {
+                  const tweets = await twitter.searchTweets(query, 8);
+                  return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
+                },
+                xLinks: async (query: string) => {
+                  const tweets = await twitter.searchTweets(query, 10);
+                  return twitter.extractUrls(tweets);
+                },
+                signalAccounts: () => ["CodinCowboy","AxiomBot","serc1n","YigitDuman","OnchainDataNerd","lookonchain","DefiIgnas","punk6529","0xAlexKorn"],
+              } : {}),
               learningTerms: async () => {
                 const learnings = await memory.getCoreLearnings(6);
                 return learnings.map(l => (l.insight || "").split(/\s+/).slice(0, 5).join(" ")).filter(t => t.length > 8);
+              },
+              ingestToCorpus: async (domain: string, title: string, body: string) => {
+                await knowledge.addItem(domain as any, title, body, "ingested", 0.55);
               },
             });
             state.researchSummary  = await researchLoop.formatForContext();
@@ -1644,22 +1721,32 @@ async function execute(decision: Decision): Promise<void> {
               }
               scoutHistory[topic] = Date.now();
               await kiraRedis.setJson("kira:scout:history", scoutHistory);
-              const tweets = await twitter.searchTweets(topic, 10);
-              const links  = twitter.extractUrls(tweets);
-              let learned  = "";
+              // Prefer real web search; fall back to X only if the account is live.
+              const xReadable3 = X_CAN_WRITE && state.xApiAvailable;
+              let links: string[] = [];
+              const webResults = await webSearchClient.search(topic, 6);
+              if (webResults.length > 0) {
+                links = webResults.map(r => r.url).filter(Boolean);
+              } else if (xReadable3) {
+                try {
+                  const tweets = await twitter.searchTweets(topic, 10);
+                  links = twitter.extractUrls(tweets);
+                } catch { links = []; }
+              }
+              let learned = "";
               if (links.length > 0) {
                 const text = await docs.readArbitraryUrl(links[0]).catch(() => "");
                 if (text && text.length > 200) {
                   learned = `Scouted "${topic}": ${text.slice(0, 180).replace(/\s+/g, " ")}`;
                 }
               }
-              if (!learned && tweets.length > 0) {
-                learned = `Scouted "${topic}" on X: ${tweets.length} recent discussions`;
+              if (!learned && webResults.length > 0) {
+                learned = `Scouted "${topic}": ${webResults[0].title} — ${webResults[0].snippet.slice(0, 140)}`;
               }
               if (learned) {
                 state.recentLearnings.push(learned);
                 await memory.addCoreLearning(`Frontier scout: ${topic}`, learned, 0.45);
-                console.log(`[Research] (light scout) ${topic} — ${links.length} links, ${tweets.length} posts`);
+                console.log(`[Research] (light scout) ${topic} — ${links.length} links`);
               } else {
                 console.log(`[Research] (light scout) ${topic} — nothing notable`);
               }
@@ -1727,6 +1814,7 @@ async function kiraLoop(): Promise<void> {
     state.multiAgentSummary = await agentNetwork.formatForContext();
   } catch (err: any) { console.error("Agent network init error:", err?.message); }
   console.log("Modules initialised");
+  console.log(`[WebSearch] ${WEB_SEARCH_ENABLED ? "Brave web search ON" : "DISABLED (no BRAVE_SEARCH_API_KEY) — research uses on-chain sources only"}`);
 
   if (X_ENABLED) {
     state.xApiAvailable = await twitter.init();
@@ -1760,6 +1848,9 @@ async function kiraLoop(): Promise<void> {
     state.lastWeeklyReport = parseInt(savedWeekly) || 0;
     console.log("Weekly report timestamp restored");
   }
+
+  const savedDigest = await kiraRedis.get("kira:last_research_digest");
+  if (savedDigest) state.lastResearchDigest = parseInt(savedDigest) || 0;
 
   // Restore recent post themes so theme rotation survives restarts
   const savedThemes = await kiraRedis.getJson<string[]>("kira:recent_themes");
