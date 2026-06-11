@@ -256,11 +256,20 @@ export class KiraKnowledge {
   // Convenience: relevant knowledge formatted for the decision prompt, with L3
   // instrumentation recording WHICH items fed the decision (see below).
   async getRelevantKnowledgeForContext(context: string, decisionTag?: string): Promise<string> {
+    const { text } = await this.getRelevantKnowledgeWithItems(context, decisionTag);
+    return text;
+  }
+
+  // ARC 1 attribution support: same retrieval, but ALSO returns the items so a
+  // conviction call can record WHICH knowledge (and which sources) fed the decision.
+  // This is what Arcs 2-3 need to let outcomes judge inputs.
+  async getRelevantKnowledgeWithItems(context: string, decisionTag?: string): Promise<{ text: string; items: KnowledgeItem[] }> {
     const items = await this.getRelevantKnowledge(context, 5);
-    if (!items.length) return "No corpus knowledge matched this context.";
+    if (!items.length) return { text: "No corpus knowledge matched this context.", items: [] };
     // L3: record that these items were surfaced into a decision.
     await this.recordKnowledgeUse(items.map(i => i.id), decisionTag || "decision");
-    return items.map(i => `[${i.domain}] ${i.title}: ${i.body}`).join("  •  ");
+    const text = items.map(i => `[${i.domain}] ${i.title}: ${i.body}`).join("  •  ");
+    return { text, items };
   }
 
   // ── L3: INSTRUMENTATION (scaffolding, NOT claimed measurement) ──────────────────
