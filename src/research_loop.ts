@@ -33,16 +33,34 @@ const K = {
 // Research cadence — once every 6h by default
 const CYCLE_INTERVAL_MS = parseInt(process.env.RESEARCH_INTERVAL_MS || String(6 * 60 * 60 * 1000));
 
-// Seed sources/queries KIRA scouts. She expands these over time via learnings.
+// Seed sources/queries KIRA scouts. DOMAIN-SCOPED, not standard-scoped: the goal is to
+// track the whole agentic / on-chain-AI frontier — new standards (ERC or not), new
+// protocols, new chains, new agent registries/marketplaces — anchored by today's known
+// landmarks but NOT limited to them. The newest development is usually the biggest
+// opportunity (x402 wasn't in the original seeds; she picked it up via expansion).
+// She expands these further over time via promoteTopic().
 const SCOUT_QUERIES = [
+  // Known standards (current anchors)
   "ERC-8004 trustless agents",
   "ERC-8257 agent tool registry",
-  "x402 payment agents",
-  "autonomous AI agent crypto",
-  "onchain AI agent Base",
-  "AI agent infrastructure 2026",
-  "agent to agent protocol A2A",
   "ERC-6551 token bound account agents",
+  // Payments / value transfer for agents
+  "x402 payment agents",
+  "x402 EIP-3009 agent payments",
+  "agent micropayments USDC onchain",
+  // Tooling / SDKs / registries (incl. emerging surfaces beyond OpenSea's)
+  "OpenSea tool-sdk agent tools update",
+  "agent skill registry marketplace",   // catches Postera and similar
+  "Postera agent registry skills",
+  // Coordination / identity / discovery
+  "agent to agent protocol A2A",
+  "onchain agent identity reputation",
+  "agent discovery onchain registry",
+  // Broad frontier (catches the NEXT standard before it's named)
+  "new ERC standard AI agents",
+  "autonomous AI agent crypto infrastructure",
+  "onchain AI agent Base Solana",
+  "AI agent infrastructure 2026",
 ];
 
 // #11 (refinement): capabilities KIRA ALREADY has. Findings whose "needs_code" really
@@ -108,7 +126,9 @@ export interface BuildRec {
 export interface ResearchTools {
   webSearch:  (query: string) => Promise<Array<{ title: string; url: string; snippet: string }>>;
   webFetch:   (url: string) => Promise<string>;
-  xSearch:    (query: string) => Promise<Array<{ text: string; author: string }>>;
+  // X reads are OPTIONAL — omitted entirely when the X account is unavailable
+  // (suspended). The loop runs fine on web + on-chain alone.
+  xSearch?:   (query: string) => Promise<Array<{ text: string; author: string }>>;
   // Returns real external links shared inside tweets matching a query — lets KIRA
   // read the actual articles/repos people cite, not just tweet text.
   xLinks?:    (query: string) => Promise<string[]>;
@@ -116,6 +136,10 @@ export interface ResearchTools {
   signalAccounts?: () => string[];
   // Recent learnings KIRA can mine for follow-up search terms.
   learningTerms?: () => Promise<string[]>;
+  // Corpus-growth hook: when research surfaces a DURABLE protocol/standard fact (not a
+  // transient build-rec), KIRA promotes it into her knowledge corpus so her understanding
+  // of the ecosystem compounds over time. Wired in index.ts to knowledge.addItem().
+  ingestToCorpus?: (domain: string, title: string, body: string) => Promise<void>;
 }
 
 export class KiraResearchLoop {
@@ -235,6 +259,18 @@ export class KiraResearchLoop {
         if (f.relevance >= 0.65 && (f.category === "standard" || f.category === "protocol" || f.category === "tool")) {
           await this.queuePost(f);
           postsQueued++;
+        }
+        // CORPUS GROWTH: a durable protocol/standard fact becomes permanent knowledge.
+        // This is the "KIRA genuinely gets smarter over time" loop — her understanding of
+        // the ecosystem compounds as she discovers and ingests new standards/protocols.
+        if (tools.ingestToCorpus && f.relevance >= 0.7 &&
+            (f.category === "standard" || f.category === "protocol")) {
+          try {
+            await tools.ingestToCorpus("protocol", f.title, `${f.summary} [discovered ${new Date().toISOString().slice(0,10)}, source: ${f.source}]`);
+            console.log(`[Research] Ingested into corpus: ${f.title.slice(0, 60)}`);
+          } catch (err: any) {
+            console.warn(`[Research] corpus ingest failed: ${err?.message}`);
+          }
         }
       }
 
