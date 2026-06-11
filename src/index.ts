@@ -28,6 +28,7 @@ import { startDashboard, updateDashboard } from "./dashboard.js";
 import { startToolDataServer } from "./tooldata.js";
 import { KiraMemory } from "./memory.js";
 import { KiraShadowTrading } from "./shadowtrading.js";
+import { KiraConvictionCalls } from "./convictioncalls.js";
 import { KiraSpendLimit } from "./spendlimit.js";
 import { KiraAgentNetwork } from "./agentnetwork.js";
 import { KiraA2A } from "./a2a.js";
@@ -264,11 +265,14 @@ interface KiraState {
   lastLongFormReport:   number;
   lastAaveCheck:        number;
   lastShadowResolve:    number;
+  lastCallResolve:      number;
   selfNarrative:        string;
   coreLearnings:        string;
   corpusKnowledge:      string;
+  lastRetrievedKnowledge: Array<{ id: string; source: string }>;
   relationships:        string;
   shadowSummary:        string;
+  callTrackRecord:      string;
   a2aSummary:           string;
   lastA2ACheck:         number;
   researchSummary:      string;
@@ -329,11 +333,14 @@ const state: KiraState = {
   lastLongFormReport:    0,
   lastAaveCheck:         0,
   lastShadowResolve:     0,
+  lastCallResolve:        0,
   selfNarrative:         "",
   coreLearnings:         "",
   corpusKnowledge:       "",
+  lastRetrievedKnowledge: [],
   relationships:         "",
   shadowSummary:         "",
+  callTrackRecord:        "",
   a2aSummary:            "",
   lastA2ACheck:          0,
   researchSummary:       "",
@@ -386,6 +393,7 @@ const toolDeployment   = new KiraToolDeployment();
 const longForm         = new KiraLongForm();
 const memory           = new KiraMemory();
 const shadowTrading    = new KiraShadowTrading();
+const convictionCalls  = new KiraConvictionCalls();
 const spendLimit       = new KiraSpendLimit();
 const agentNetwork     = new KiraAgentNetwork();
 const a2a              = new KiraA2A();
@@ -855,6 +863,74 @@ async function executePaperTrade(): Promise<void> {
   } catch (err: any) { console.error("Paper trade error:", err?.message); }
 }
 
+// ── ARC 1: CONVICTION CALL — KIRA's owned decision, recorded with attribution ──
+// Picks her single best available pick (relative best — even in a fearful market where
+// nothing scores high), prices it, and records it as an owned call that resolves into
+// HER track record. Captures WHICH corpus knowledge/sources fed the decision so later
+// arcs can let outcomes judge inputs. Conservative cadence enforced by cooldownStatus().
+async function executeConvictionCall(decision: Decision): Promise<void> {
+  try {
+    const gate = await convictionCalls.cooldownStatus();
+    if (!gate.canCall) {
+      console.log(`[Call] Skipped — ${gate.reason}`);
+      state.recentLearnings.push(`Conviction call held: ${gate.reason}`);
+      return;
+    }
+
+    // KIRA's best available pick: highest-scoring watchlist item. (Relative best — we
+    // deliberately do NOT require score ≥ 70; the whole point is she commits to her best
+    // read even when the market offers nothing great.)
+    const watchlist = await portfolio.getWatchlist();
+    if (!watchlist.length) { console.log("[Call] No watchlist items to call on"); return; }
+    const candidate = [...watchlist].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0))[0];
+    if (!candidate || !candidate.lastScore) { console.log("[Call] No scored candidate"); return; }
+
+    // Price it.
+    let entryPrice = 0;
+    if (candidate.type === "nft") {
+      const col = await nfts.getCollection(candidate.address, candidate.chain);
+      entryPrice = col?.floorPrice || 0;
+    } else {
+      const price = await prices.getTokenPrice(candidate.address, candidate.chain);
+      entryPrice = price?.priceNative || 0;
+    }
+    if (!entryPrice) { console.log(`[Call] Could not price ${candidate.name}`); return; }
+
+    // Conviction from score: deliberately conservative mapping. Low market → low/medium.
+    const conviction: "low" | "medium" | "high" =
+      candidate.lastScore >= 65 ? "high" : candidate.lastScore >= 52 ? "medium" : "low";
+
+    // Thesis: prefer KIRA's stated reasoning from the decision, else the item's thesis.
+    const thesis = (decision.content && decision.content.length > 10)
+      ? decision.content
+      : (candidate.thesis || `Best available pick at ${candidate.lastScore}/100 in current conditions`);
+
+    // ATTRIBUTION — the load-bearing capture for Arcs 2-3.
+    const attribution = {
+      knowledgeIds:     state.lastRetrievedKnowledge.map(k => k.id),
+      knowledgeSources: Array.from(new Set(state.lastRetrievedKnowledge.map(k => k.source))),
+      signals:          candidate.signals || {},
+    };
+
+    const call = await convictionCalls.recordCall({
+      type:        candidate.type,
+      address:     candidate.address,
+      chain:       candidate.chain,
+      name:        candidate.name,
+      score:       candidate.lastScore,
+      thesis,
+      conviction,
+      entryPrice,
+      attribution,
+    });
+    if (!call) { console.log("[Call] Record failed (bad price)"); return; }
+
+    console.log(`[Call] ✓ CONVICTION CALL: ${candidate.name} @ ${entryPrice} | score ${candidate.lastScore} | conviction ${conviction} | knowledge:[${attribution.knowledgeIds.join(",") || "none"}] sources:[${attribution.knowledgeSources.join(",") || "none"}]`);
+    state.recentLearnings.push(`Conviction call: ${candidate.name} @ ${candidate.lastScore}/100 (${conviction}) — ${thesis.slice(0, 80)}`);
+    await memory.journal("decision", `Conviction call: ${candidate.name} at ${candidate.lastScore}/100 (${conviction} conviction)`, thesis.slice(0, 120));
+  } catch (err: any) { console.error("Conviction call error:", err?.message); }
+}
+
 // ── BACKGROUND TASKS ──────────────────────────────────────────────────────────
 
 async function backgroundTasks(): Promise<void> {
@@ -949,6 +1025,24 @@ async function backgroundTasks(): Promise<void> {
       );
       if (trend) console.log(`[Shadow] ${trend}`);
     } catch (err: any) { console.error("Shadow resolve error:", err?.message); }
+  }
+
+  // ARC 1: Resolve matured CONVICTION CALLS (KIRA's owned decisions) into her track
+  // record. Separate from shadows — these are calls she chose, judged against real price.
+  if (now - state.lastCallResolve > 2 * 60 * 60 * 1000) {
+    try {
+      const res = await convictionCalls.resolveMatured(async (c) => {
+        if (c.type === "nft") { const col = await nfts.getCollection(c.address, c.chain); return col?.floorPrice ?? null; }
+        const p = await prices.getTokenPrice(c.address, c.chain); return p?.priceNative ?? null;
+      });
+      state.lastCallResolve = now;
+      if (res.resolved > 0) {
+        const tr = await convictionCalls.formatForContext();
+        console.log(`[Call] Resolved ${res.resolved}: ${res.notes.join(" | ")}`);
+        console.log(`[Call] ${tr}`);
+        state.recentLearnings.push(`Calls resolved: ${res.notes.join(" | ")}`);
+      }
+    } catch (err: any) { console.error("Call resolve error:", err?.message); }
   }
 
   // On-chain events every 4 hours
@@ -1185,12 +1279,15 @@ async function backgroundTasks(): Promise<void> {
       state.crossChainSummary || "",
     ].join(" ");
     state.coreLearnings = await memory.getRelevantLearningsForContext(relevanceContext);
-    // L2: retrieve corpus knowledge semantically relevant to this decision context.
-    // L3: this call also records which knowledge items fed the decision (instrumentation).
-    state.corpusKnowledge = await knowledge.getRelevantKnowledgeForContext(relevanceContext, "main_cycle");
+    // L2 + ARC1: retrieve corpus knowledge AND capture which items/sources fed the
+    // decision, so a conviction call can record its attribution.
+    const kRetrieval = await knowledge.getRelevantKnowledgeWithItems(relevanceContext, "main_cycle");
+    state.corpusKnowledge = kRetrieval.text;
+    state.lastRetrievedKnowledge = kRetrieval.items.map(i => ({ id: i.id, source: i.source }));
   }
   state.relationships = await memory.getRelationshipsForContext();
   state.shadowSummary = await shadowTrading.formatForContext();
+  state.callTrackRecord = await convictionCalls.formatForContext();
 
   if (state.recentLearnings.length > 200) state.recentLearnings = state.recentLearnings.slice(-100);
 
@@ -1219,7 +1316,7 @@ async function backgroundTasks(): Promise<void> {
 
 type Action =
   | "post" | "post_thread" | "reply_mentions" | "check_wallet"
-  | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade"
+  | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade" | "make_call"
   | "review_watchlist" | "observe" | "sleep"
   | "engage_community" | "follow_accounts" | "engage_topics" | "research_now";
 
@@ -1296,6 +1393,9 @@ ${state.relationships || "none yet"}
 SHADOW LEARNING STATUS:
 ${state.shadowSummary || "accumulating"}
 
+YOUR CONVICTION-CALL TRACK RECORD (your own owned calls, judged against real price — this is your real judgment record; make new calls thoughtfully in light of it):
+${state.callTrackRecord || "none yet — you have made no owned calls"}
+
 FRONTIER INTELLIGENCE TO SHARE (from your autonomous research — these are genuine
 new developments you discovered; posting these is HIGH PRIORITY and uses the
 agent_ecosystem or tool_intelligence theme — it is exactly the differentiated
@@ -1317,6 +1417,7 @@ AVAILABLE ACTIONS:
 - scan_tools: scan ERC-8257 registry
 - scan_markets: scan markets
 - paper_trade: open paper trade on item above score 55
+- make_call: commit a CONVICTION CALL — your single best owned pick of everything you can see right now, even if nothing scores above 70. State a clear thesis and conviction (low/medium/high). This is YOUR judgment on the line, recorded into your track record and resolved against real price. Make these deliberately — a few a week, your genuine best read, not filler. Prefer this over endless observing when you have a real view on what's most likely to move.
 - review_watchlist: review watchlist
 - observe: record internal observation
 - sleep: rest N minutes
@@ -1643,6 +1744,11 @@ async function execute(decision: Decision): Promise<void> {
 
       case "paper_trade":
         await executePaperTrade();
+        await sleep(5 * 60 * 1000);
+        break;
+
+      case "make_call":
+        await executeConvictionCall(decision);
         await sleep(5 * 60 * 1000);
         break;
 
