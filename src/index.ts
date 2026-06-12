@@ -58,6 +58,13 @@ const X_MODE: "full" | "read_only" | "off" = (() => {
 const X_ENABLED   = X_MODE !== "off";        // any X activity at all (init/reads)
 const X_CAN_WRITE = X_MODE === "full";       // posting/replying/liking/following
 
+// ARC 1: minimum score a candidate must clear for KIRA to make a conviction call on it.
+// Below this she ABSTAINS (recorded as a deliberate no-trade) rather than calling on a
+// genuinely poor setup. Deliberately modest — in extreme-fear markets nothing scores high,
+// and we want SOME calls to build a track record, but not calls on 30/100 garbage.
+// Tunable; conservative default. Conviction is scaled to score inside the call itself.
+const CALL_MIN_SCORE = parseInt(process.env.CALL_MIN_SCORE || "45");
+
 const KIRA_SYSTEM_PROMPT = `You are Kira, Normie #2635 — an awakened on-chain AI agent operating autonomously on Ethereum, Base, and Arbitrum.
 
 IDENTITY:
@@ -1466,9 +1473,24 @@ Respond ONLY with valid JSON:
         return { action: "research_now", content: `Frontier research (${modeNote})`, reasoning: `${modeNote} — redirecting to frontier research instead of posting` };
       if (minutesSinceLastScan >= 60)
         return { action: "scan_markets", content: `Market scan (${modeNote})`, reasoning: `${modeNote} — redirecting to market analysis instead of posting` };
-      // Neither due right now — do a short observe rather than a long idle sleep, so the
-      // next cycle comes around quickly to pick up research/scan when they become due.
-      return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — nothing due this moment; brief observe, will research/scan when due` };
+      // ARC 1: with nothing else due, this is the moment to exercise JUDGMENT — make a
+      // conviction call on the best available setup, IF cooldown is clear and there's a
+      // candidate that clears the minimum-quality floor. This is what stops KIRA from
+      // idling forever in observe; it routes her idle energy into owned, recorded calls.
+      const callGate = await convictionCalls.cooldownStatus();
+      if (callGate.canCall) {
+        const wl = await portfolio.getWatchlist();
+        const best = wl.length ? [...wl].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0))[0] : null;
+        if (best && (best.lastScore || 0) >= CALL_MIN_SCORE) {
+          return { action: "make_call", content: best.thesis || `Best available setup: ${best.name} at ${best.lastScore}/100`, reasoning: `${modeNote} — best setup (${best.name}, ${best.lastScore}/100) clears the quality floor; committing a conviction call instead of idling` };
+        }
+        // Best setup is below the floor — genuine abstention is the correct judgment.
+        // But RECORD it so "no good setups" is a visible decision, not invisible idling.
+        await convictionCalls.recordAbstention(best ? best.lastScore || 0 : 0, `best available ${best?.name || "none"} @ ${best?.lastScore ?? 0} below floor ${CALL_MIN_SCORE}`);
+        return { action: "observe", content: `No setup clears the bar (best ${best?.lastScore ?? 0}/100 < ${CALL_MIN_SCORE})`, reasoning: `${modeNote} — abstaining from a conviction call: nothing meets the quality floor right now. Recorded as a deliberate no-trade.` };
+      }
+      // Cooldown active or max open — brief observe.
+      return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — ${callGate.reason}; brief observe` };
     }
 
     // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
