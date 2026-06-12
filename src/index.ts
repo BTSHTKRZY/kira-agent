@@ -29,6 +29,7 @@ import { startToolDataServer } from "./tooldata.js";
 import { KiraMemory } from "./memory.js";
 import { KiraShadowTrading } from "./shadowtrading.js";
 import { KiraConvictionCalls } from "./convictioncalls.js";
+import { KiraCallMetrics } from "./callmetrics.js";
 import { KiraSpendLimit } from "./spendlimit.js";
 import { KiraAgentNetwork } from "./agentnetwork.js";
 import { KiraA2A } from "./a2a.js";
@@ -260,6 +261,7 @@ interface KiraState {
   lastResearchCheck:    number;
   lastWeeklyReport:     number;
   lastResearchDigest:   number;
+  lastQualityReport:    number;
   lastPostTime:         number;
   lastEngagementTime:   number;
   lastTimelineEngage:   number;
@@ -328,6 +330,7 @@ const state: KiraState = {
   lastResearchCheck:     0,
   lastWeeklyReport:      0,
   lastResearchDigest:    0,
+  lastQualityReport:      0,
   lastPostTime:          0,
   lastEngagementTime:    0,
   lastTimelineEngage:    0,
@@ -401,6 +404,7 @@ const longForm         = new KiraLongForm();
 const memory           = new KiraMemory();
 const shadowTrading    = new KiraShadowTrading();
 const convictionCalls  = new KiraConvictionCalls();
+const callMetrics      = new KiraCallMetrics();
 const spendLimit       = new KiraSpendLimit();
 const agentNetwork     = new KiraAgentNetwork();
 const a2a              = new KiraA2A();
@@ -755,6 +759,30 @@ async function scanOnChainEvents(): Promise<void> {
     }
   } catch (err: any) { console.error("On-chain scan error:", err?.message); }
   state.lastOnChainScan = Date.now();
+}
+
+// ── ARC 2: DAILY DECISION-QUALITY REPORT ──────────────────────────────────────
+// Distinct from the activity/research digest. Answers "is KIRA's judgment any good, and
+// is her knowledge helping?" — but ONLY honestly: every number is stamped with sample
+// size, and the report leads with a blunt caveat when the sample is too small to mean
+// anything. The instrument runs from day one; trustworthy readings come weeks later.
+async function sendQualityReport(): Promise<void> {
+  try {
+    const calls  = await convictionCalls.getAllCalls();
+    const report = callMetrics.compute(calls);
+    // Don't email an empty report every day before any calls resolve — only send once
+    // there's at least one resolved call (or once a week regardless, to confirm liveness).
+    const resolved = report.resolvedTotal;
+    const lastSent = parseInt(await kiraRedis.get("kira:last_quality_report") || "0");
+    const weekElapsed = Date.now() - lastSent > 7 * 24 * 60 * 60 * 1000;
+    if (resolved === 0 && !weekElapsed) return;   // nothing to say yet, and not the weekly liveness ping
+
+    const body = callMetrics.format(report);
+    await sendEmail("KIRA — Decision Quality Report", body);
+    state.lastQualityReport = Date.now();
+    await kiraRedis.set("kira:last_quality_report", String(state.lastQualityReport));
+    console.log(`[Quality] Report sent — ${resolved} resolved calls`);
+  } catch (err: any) { console.error("Quality report error:", err?.message); }
 }
 
 // ── DAILY RESEARCH DIGEST ─────────────────────────────────────────────────────
@@ -1134,6 +1162,9 @@ async function backgroundTasks(): Promise<void> {
   // Daily frontier-intelligence digest (the heads-down research-mode output channel)
   if (now - state.lastResearchDigest > 24 * 60 * 60 * 1000) await sendResearchDigest();
 
+  // Daily decision-quality report (Arc 2) — honest, sample-size-stamped
+  if (now - state.lastQualityReport > 24 * 60 * 60 * 1000) await sendQualityReport();
+
   // Monthly learning review
   const oneMonth = 30 * 24 * 60 * 60 * 1000;
   if (state.cycleCount > 100 && (state.lastLearningReview === 0 || now - state.lastLearningReview > oneMonth)) {
@@ -1300,7 +1331,6 @@ async function backgroundTasks(): Promise<void> {
   state.relationships = await memory.getRelationshipsForContext();
   state.shadowSummary = await shadowTrading.formatForContext();
   state.callTrackRecord = await convictionCalls.formatForContext();
-
   if (state.recentLearnings.length > 200) state.recentLearnings = state.recentLearnings.slice(-100);
 
   // Update dashboard
@@ -1984,6 +2014,8 @@ async function kiraLoop(): Promise<void> {
 
   const savedDigest = await kiraRedis.get("kira:last_research_digest");
   if (savedDigest) state.lastResearchDigest = parseInt(savedDigest) || 0;
+  const savedQuality = await kiraRedis.get("kira:last_quality_report");
+  if (savedQuality) state.lastQualityReport = parseInt(savedQuality) || 0;
 
   // Restore recent post themes so theme rotation survives restarts
   const savedThemes = await kiraRedis.getJson<string[]>("kira:recent_themes");
