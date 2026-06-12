@@ -207,6 +207,30 @@ export class KiraConvictionCalls {
     return { resolved, notes };
   }
 
+  // ── ABSTENTION: a deliberate no-trade is also a decision ────────────────────
+  // When KIRA's best available setup doesn't clear the quality floor, abstaining is the
+  // CORRECT judgment (a good trader doesn't trade junk). But we record it so "no good
+  // setups" is a visible, counted decision — never an invisible excuse for never acting.
+  // If abstentions vastly outnumber calls over time, that's a signal to revisit either
+  // the floor or the scoring, surfaced rather than hidden.
+  async recordAbstention(bestScore: number, note: string): Promise<void> {
+    try {
+      const key = "kira:calls:abstentions";
+      const cur = await kiraRedis.getJson<{ count: number; lastTs: number; lastNote: string; recentScores: number[] }>(key)
+                  || { count: 0, lastTs: 0, lastNote: "", recentScores: [] };
+      cur.count += 1;
+      cur.lastTs = Date.now();
+      cur.lastNote = note;
+      cur.recentScores = [...(cur.recentScores || []), bestScore].slice(-20);
+      await kiraRedis.setJson(key, cur);
+    } catch { /* non-fatal */ }
+  }
+
+  async getAbstentions(): Promise<{ count: number; lastTs: number; lastNote: string; recentScores: number[] }> {
+    return await kiraRedis.getJson<{ count: number; lastTs: number; lastNote: string; recentScores: number[] }>("kira:calls:abstentions")
+           || { count: 0, lastTs: 0, lastNote: "", recentScores: [] };
+  }
+
   // ── TRACK RECORD ────────────────────────────────────────────────────────────
   async getTrackRecord(): Promise<CallTrackRecord> {
     const all = await kiraRedis.getJson<string[]>(K.calls()) || [];
@@ -243,12 +267,14 @@ export class KiraConvictionCalls {
   // Compact human-readable summary for the decision context + digests.
   async formatForContext(): Promise<string> {
     const tr = await this.getTrackRecord();
-    if (tr.total === 0) return "Conviction calls: none yet — KIRA has made no owned calls.";
+    const abs = await this.getAbstentions();
+    const absNote = abs.count > 0 ? ` | ${abs.count} abstentions (no setup cleared the bar)` : "";
+    if (tr.total === 0) return `Conviction calls: none yet — KIRA has made no owned calls.${absNote}`;
     const wr = (tr.winRate * 100).toFixed(0);
     const conf = tr.resolved < 5
       ? " (too few resolved to be meaningful yet)"
       : tr.resolved < 15 ? " (small sample)" : "";
     return `Conviction calls: ${tr.total} made, ${tr.open} open, ${tr.resolved} resolved — ` +
-           `${tr.wins}W/${tr.losses}L/${tr.flats}F, win rate ${wr}%, avg ${tr.avgPnlPct >= 0 ? "+" : ""}${tr.avgPnlPct.toFixed(1)}%${conf}`;
+           `${tr.wins}W/${tr.losses}L/${tr.flats}F, win rate ${wr}%, avg ${tr.avgPnlPct >= 0 ? "+" : ""}${tr.avgPnlPct.toFixed(1)}%${conf}${absNote}`;
   }
 }
