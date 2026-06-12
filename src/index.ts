@@ -880,7 +880,12 @@ async function executeConvictionCall(decision: Decision): Promise<void> {
     const gate = await convictionCalls.cooldownStatus();
     if (!gate.canCall) {
       console.log(`[Call] Skipped — ${gate.reason}`);
-      state.recentLearnings.push(`Conviction call held: ${gate.reason}`);
+      // Don't waste the cycle: the LLM picked make_call but the call is blocked by
+      // cooldown/max-open. Fall through to useful mission work instead of idling.
+      const scanDue = (Date.now() - state.lastMarketScan) / 60000 >= 60;
+      if (scanDue) { await scanMarketsForOpportunities(); }
+      else if (await researchLoop.isDue()) { /* research runs in backgroundTasks; just note */ state.recentLearnings.push("Call on cooldown — deferring to research/observe"); }
+      else { state.recentLearnings.push(`Call on cooldown: ${gate.reason}`); }
       return;
     }
 
