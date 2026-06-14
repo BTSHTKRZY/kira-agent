@@ -72,13 +72,25 @@ const K = {
   calls:   ()           => `kira:calls`,           // set of all call ids
   open:    ()           => `kira:calls:open`,       // set of open call ids
   counter: ()           => `kira:calls:counter`,
-  lastCall:()           => `kira:calls:lastts`,     // cadence control
+  lastCall:()           => `kira:calls:lastts`,     // global anti-burst pacing
+  assetLast:(addr: string) => `kira:calls:asset:${(addr||"").toLowerCase()}`, // per-asset cooldown
 };
 
-// Cadence guards — keep calls deliberate, not churny.
-const CALL_COOLDOWN_MS   = parseInt(process.env.CALL_COOLDOWN_MS   || String(36 * 60 * 60 * 1000)); // ~1.5 days between calls
-const MAX_OPEN_CALLS     = parseInt(process.env.MAX_OPEN_CALLS     || "5");   // at most 5 live judgments at once
-const DEFAULT_HORIZON    = parseInt(process.env.CALL_HORIZON_DAYS  || "7");
+// Cadence guards — keep calls DELIBERATE without artificially capping good ideas.
+// Old design used one global ~36h cooldown, which blocked ALL calls after any single
+// call — so KIRA couldn't act on a genuinely better, DIFFERENT setup that appeared during
+// the window. That both mismatched real trading judgment (a trader holds a diversified
+// book) AND throttled the track-record data generation Arcs 2-3 depend on. New design:
+//   • PER-ASSET cooldown  — don't re-call the SAME name within ~36h (prevents spamming one thesis)
+//   • ANTI-BURST gap      — a short global gap (~3h) so she can't fire many in one burst,
+//                           but CAN build a book of distinct calls over a day or two
+//   • MAX_OPEN_CALLS cap  — still at most 5 live calls at once
+// The 45 quality FLOOR (enforced in index.ts) is the real selectivity discipline now —
+// she can make several calls, but only on setups that clear the bar.
+const CALL_BURST_GAP_MS     = parseInt(process.env.CALL_BURST_GAP_MS     || String(3 * 60 * 60 * 1000));  // ~3h between ANY two calls
+const CALL_ASSET_COOLDOWN_MS= parseInt(process.env.CALL_ASSET_COOLDOWN_MS|| String(36 * 60 * 60 * 1000)); // ~36h before re-calling the SAME asset
+const MAX_OPEN_CALLS        = parseInt(process.env.MAX_OPEN_CALLS        || "5");
+const DEFAULT_HORIZON       = parseInt(process.env.CALL_HORIZON_DAYS     || "7");
 const FLAT_BAND_PCT      = 2;     // |pnl| < 2% counts as "flat", not win/loss
 // Same data-artifact guard the shadow system uses: a >±500% short-horizon move on a
 // tracked asset is a mis-scaled/near-zero price, not a real move. Don't let it pollute
@@ -101,18 +113,29 @@ export class KiraConvictionCalls {
   }
 
   // ── CADENCE: can KIRA make a call right now? ────────────────────────────────
-  // Returns a reason string if blocked, or null if clear. Keeps calls deliberate.
-  async cooldownStatus(): Promise<{ canCall: boolean; reason: string; openCount: number }> {
-    const openIds  = await kiraRedis.getJson<string[]>(K.open()) || [];
+  // Pass the candidate's address to also enforce the per-asset cooldown. Omit it for a
+  // generic "can I make ANY call" check (anti-burst + max-open only).
+  async cooldownStatus(candidateAddress?: string): Promise<{ canCall: boolean; reason: string; openCount: number }> {
+    const openIds   = await kiraRedis.getJson<string[]>(K.open()) || [];
     const openCount = openIds.length;
     if (openCount >= MAX_OPEN_CALLS) {
       return { canCall: false, reason: `Max open calls reached (${openCount}/${MAX_OPEN_CALLS}) — let some resolve first`, openCount };
     }
-    const last = parseInt(await kiraRedis.get(K.lastCall()) || "0");
+    // Anti-burst: short global gap so she can't fire a flurry in one cycle.
+    const last  = parseInt(await kiraRedis.get(K.lastCall()) || "0");
     const since = Date.now() - last;
-    if (last > 0 && since < CALL_COOLDOWN_MS) {
-      const hrs = Math.round((CALL_COOLDOWN_MS - since) / 3.6e6);
-      return { canCall: false, reason: `Call cooldown active (~${hrs}h remaining) — calls stay deliberate`, openCount };
+    if (last > 0 && since < CALL_BURST_GAP_MS) {
+      const mins = Math.round((CALL_BURST_GAP_MS - since) / 60000);
+      return { canCall: false, reason: `Anti-burst pacing (~${mins}m since last call) — spacing calls out`, openCount };
+    }
+    // Per-asset: don't re-call the SAME name too soon (prevents spamming one thesis).
+    if (candidateAddress) {
+      const assetLast = parseInt(await kiraRedis.get(K.assetLast(candidateAddress)) || "0");
+      const assetSince = Date.now() - assetLast;
+      if (assetLast > 0 && assetSince < CALL_ASSET_COOLDOWN_MS) {
+        const hrs = Math.round((CALL_ASSET_COOLDOWN_MS - assetSince) / 3.6e6);
+        return { canCall: false, reason: `Already called this asset recently (~${hrs}h until re-callable) — pick a different setup or abstain`, openCount };
+      }
     }
     return { canCall: true, reason: "clear", openCount };
   }
@@ -153,7 +176,8 @@ export class KiraConvictionCalls {
     all.push(id); open.push(id);
     await kiraRedis.setJson(K.calls(), all.slice(-1000));
     await kiraRedis.setJson(K.open(),  open);
-    await kiraRedis.set(K.lastCall(), String(Date.now()));
+    await kiraRedis.set(K.lastCall(), String(Date.now()));                      // anti-burst clock
+    await kiraRedis.set(K.assetLast(params.address), String(Date.now()));        // per-asset clock
     return call;
   }
 
