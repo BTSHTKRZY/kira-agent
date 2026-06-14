@@ -28,10 +28,15 @@ const K = {
   dynamicTopics: () => `kira:research:dynamic_topics`,   // #5 self-expanded scout topics
   gapHits:       () => `kira:research:gap_hits`,          // #11 capability-gap frequency
   postQueue:   () => `kira:research:postqueue`,
+  // ARC 4: outward opportunity scouting (distinct from inward gap-finding)
+  lastScout:   () => `kira:research:last_opp_scout`,
+  opportunities: () => `kira:research:opportunities`,
 };
 
 // Research cadence — once every 6h by default
 const CYCLE_INTERVAL_MS = parseInt(process.env.RESEARCH_INTERVAL_MS || String(6 * 60 * 60 * 1000));
+// ARC 4 opportunity-scout cadence — less frequent than research (it's strategic, not news)
+const OPP_SCOUT_INTERVAL_MS = parseInt(process.env.OPP_SCOUT_INTERVAL_MS || String(24 * 60 * 60 * 1000));
 
 // Seed sources/queries KIRA scouts. DOMAIN-SCOPED, not standard-scoped: the goal is to
 // track the whole agentic / on-chain-AI frontier — new standards (ERC or not), new
@@ -61,6 +66,15 @@ const SCOUT_QUERIES = [
   "autonomous AI agent crypto infrastructure",
   "onchain AI agent Base Solana",
   "AI agent infrastructure 2026",
+  // Recency-oriented (pull NEW content, not the same evergreen articles — addresses the
+  // findings decline from query staleness; "latest/this week/new" bias Brave toward fresh results)
+  "latest onchain agent standard announcement",
+  "new agent protocol launch this week",
+  "ERC draft agent 2026 latest",
+  "x402 adoption news latest",
+  "agent tool registry new release",
+  "AI agent security incident vulnerability",   // defensive frontier — what's breaking
+  "onchain agent funding launch 2026",
 ];
 
 // #11 (refinement): capabilities KIRA ALREADY has. Findings whose "needs_code" really
@@ -71,14 +85,18 @@ const SCOUT_QUERIES = [
 // Keep in sync as KIRA gains capabilities (e.g. add x402/tool-invocation once #12 ships).
 const EXISTING_CAPABILITIES: Array<{ name: string; signals: string[] }> = [
   { name: "erc8257-registry-read", signals: ["query the erc-8257 registry", "read the registry", "discover available tools", "tool discovery", "parse tool metadata", "registry contract", "list tools", "search tools", "discover and integrate"] },
-  { name: "erc8004-agent-discovery", signals: ["erc-8004 registry", "agent identity registry", "discover agents", "awakened normie", "agent directory"] },
+  { name: "erc8004-agent-discovery", signals: ["erc-8004", "eip-8004", "agent identity registry", "register agent onchain", "agent registration", "discover agents", "awakened normie", "agent directory", "trustless agents"] },
   { name: "market-scan-scoring", signals: ["scan nft", "score collections", "floor price", "scan markets", "watchlist"] },
   { name: "x-engagement", signals: ["post to x", "reply to mentions", "engage on twitter", "social engagement"] },
   { name: "research-loop", signals: ["scout x and web", "research developments", "distill findings"] },
+  { name: "agent-wallet-limits", signals: ["agent wallet", "spending limit", "spend cap", "programmable authorization", "wallet guardrails", "autonomous signing"] },
 ];
 
 function matchesExistingCapability(text: string): string | null {
-  const t = text.toLowerCase();
+  // Normalize EIP-NNNN → ERC-NNNN so a finding framed as "EIP-8004" matches the
+  // "erc-8004" capability she already has (same standard, different prefix). This is the
+  // fix for renamed/re-sourced duplicates slipping past the filter as false "gaps".
+  const t = text.toLowerCase().replace(/\beip-(\d)/g, "erc-$1");
   for (const cap of EXISTING_CAPABILITIES) {
     if (cap.signals.some(s => t.includes(s))) return cap.name;
   }
@@ -109,6 +127,8 @@ export interface Finding {
   category:    "standard" | "tool" | "protocol" | "agent" | "infra" | "market" | "other";
   actionable:  "now" | "needs_code" | "informational";
   action?:     string;       // what KIRA will do / recommend
+  isCompetingFramework?: boolean;
+  sourceTrust?: "high" | "medium" | "low";
   ts:          number;
 }
 
@@ -118,6 +138,22 @@ export interface BuildRec {
   rationale:   string;
   whatItNeeds: string;       // the code capability KIRA lacks
   priority:    "high" | "medium" | "low";
+  source:      string;
+  ts:          number;
+  sent:        boolean;
+}
+
+// ARC 4: an OUTWARD opportunity — something the ecosystem NEEDS that KIRA could build and
+// monetize, as opposed to a gap in KIRA's own capabilities. This is the revenue-thesis
+// engine: execution-based ("build X, others will use it") not capability-based ("I lack X").
+export interface Opportunity {
+  id:          string;
+  title:       string;       // the thing to build
+  need:        string;       // the ecosystem need / pain it addresses
+  whoWouldUse: string;       // which agents/users would consume it
+  whyKira:     string;       // why KIRA is positioned to build it (fits her stack/thesis)
+  monetization:string;       // how it could earn (x402 per-call, NFT-gated, etc.)
+  confidence:  "speculative" | "plausible" | "strong";
   source:      string;
   ts:          number;
   sent:        boolean;
@@ -354,35 +390,66 @@ export class KiraResearchLoop {
   private async distill(content: { url: string; title: string; text: string; query: string }): Promise<Finding | null> {
     try {
       const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-5", max_tokens: 400,
+        model: "claude-sonnet-4-5", max_tokens: 450,
         system: `You are KIRA, an autonomous on-chain AI agent studying the agent/crypto ecosystem to become more capable.
 Analyse this source. Determine: is there something genuinely NEW and RELEVANT to an autonomous on-chain agent
 (new standard, tool, protocol, infra, market shift)? Be skeptical — most content is noise.
 
+KIRA ALREADY HAS: her own agent architecture (memory, tool-registry via ERC-8257, ERC-8004 identity
+registration, ERC-6551 TBAs, autonomous wallet+signing, spend limits, paper trading, A2A messaging,
+cross-chain read scanning incl. Solana). She is Base/Ethereum-native by design.
+
+Be RUTHLESS about "needs_code". Classify as "needs_code" ONLY if it is a genuinely NEW capability KIRA
+lacks AND that fits her on-chain Base/Ethereum thesis. Do NOT classify as needs_code:
+- A COMPETING agent framework she'd have to adopt (e.g. another agent SDK/kit/toolkit). She has her own
+  architecture; competitors are "informational" (learn from, don't adopt).
+- A capability she already has under a different name (e.g. "EIP-8004" = ERC-8004 she's registered on;
+  "skills registry" = ERC-8257 she uses; "agent wallet with limits" = her spend limits).
+- An off-thesis expansion (e.g. Solana-native frameworks, token-launch tooling).
+These are "informational" at most.
+
+Also weigh SOURCE QUALITY: primary sources (GitHub, official docs, the standard's own repo, reputable
+protocol blogs) are high-trust. Crypto-exchange news pages, SEO content farms, generic local-news sites,
+and aggregators are LOW-trust — discount their relevance heavily (cap relevance ≤0.5) unless the underlying
+fact is independently notable.
+
 Classify "actionable":
-- "now" = KIRA can act on this within existing capabilities (learn it, adjust behavior, post about it)
-- "needs_code" = acting on this would require NEW CODE KIRA doesn't have (a new integration/handler/module)
-- "informational" = worth knowing, no action
+- "now" = KIRA can act on this within existing capabilities (learn it, adjust behavior)
+- "needs_code" = a genuinely NEW, on-thesis capability she lacks (see ruthless criteria above)
+- "informational" = worth knowing, no action (this is the DEFAULT for competing frameworks & landscape news)
 
 Respond ONLY with JSON:
 { "relevant": true/false, "title": "...", "summary": "1-2 sentences", "relevance": 0.0-1.0,
   "category": "standard|tool|protocol|agent|infra|market|other",
   "actionable": "now|needs_code|informational",
+  "isCompetingFramework": true/false,
+  "sourceTrust": "high|medium|low",
   "action": "what KIRA should do or what code it would need" }`,
         messages: [{ role: "user", content: `Query: ${content.query}\nTitle: ${content.title}\nURL: ${content.url}\n\nContent:\n${content.text.slice(0, 4000)}` }],
       });
       const text   = response.content[0].type === "text" ? response.content[0].text.trim() : "{}";
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
       if (!parsed.relevant) return null;
+      // Safety net beyond the prompt: hard-demote competing frameworks and low-trust
+      // sources OUT of needs_code, regardless of what the model said. This is what stops
+      // the "5 HIGH false-positives in a row" pattern (competing kits / exchange-news SEO).
+      let actionable = parsed.actionable || "informational";
+      if (actionable === "needs_code" && parsed.isCompetingFramework === true) {
+        actionable = "informational";
+      }
+      let relevance = typeof parsed.relevance === "number" ? parsed.relevance : 0.5;
+      if (parsed.sourceTrust === "low") relevance = Math.min(relevance, 0.5);  // cap low-trust
       return {
         id:         `F${Date.now()}${Math.floor(Math.random()*1000)}`,
         source:     content.url,
         title:      parsed.title || content.title,
         summary:    parsed.summary || "",
-        relevance:  typeof parsed.relevance === "number" ? parsed.relevance : 0.5,
+        relevance,
         category:   parsed.category || "other",
-        actionable: parsed.actionable || "informational",
+        actionable,
         action:     parsed.action || "",
+        isCompetingFramework: parsed.isCompetingFramework === true,
+        sourceTrust: parsed.sourceTrust || "medium",
         ts:         Date.now(),
       };
     } catch (err: any) {
@@ -406,7 +473,9 @@ Respond ONLY with JSON:
       title:       f.title,
       rationale:   f.summary,
       whatItNeeds: f.action || "New capability — see source",
-      priority:    f.relevance >= 0.75 ? "high" : f.relevance >= 0.55 ? "medium" : "low",
+      priority:    (f.sourceTrust === "low") ? "low"
+                   : f.relevance >= 0.75 ? "high"
+                   : f.relevance >= 0.55 ? "medium" : "low",
       source:      f.source,
       ts:          Date.now(),
       sent:        false,
@@ -455,6 +524,106 @@ Respond ONLY with JSON:
 
     await kiraRedis.setJson(K.gapHits(), gaps);
     return escalated;
+  }
+
+  // ARC 4 OUTWARD OPPORTUNITY SCOUTING
+  async isOppScoutDue(): Promise<boolean> {
+    const last = await kiraRedis.get(K.lastScout()) || "0";
+    return Date.now() - parseInt(last) > OPP_SCOUT_INTERVAL_MS;
+  }
+
+  // Scout the ecosystem for what it NEEDS — build-and-monetize opportunities for KIRA as a
+  // tool PRODUCER. Deliberately different from the inward gap-finder: instead of "what does
+  // KIRA lack" (which keeps surfacing competing frameworks as false gaps), it asks "what's
+  // missing/painful in the agent ecosystem that KIRA could build and others would pay to
+  // use." Produces step-1 recommendations only — building stays human-in-the-loop.
+  async scoutOpportunities(tools: ResearchTools): Promise<Opportunity[]> {
+    try {
+      await kiraRedis.set(K.lastScout(), String(Date.now()));
+      const recent = (await kiraRedis.getJson<Finding[]>(K.findings()) || []).slice(0, 25);
+      const findingsBlob = recent.map(f => `- ${f.title}: ${f.summary} [${f.category}]`).join("\n").slice(0, 3500);
+
+      let webBlob = "";
+      try {
+        const q = ["agent developers need tool missing", "onchain agent pain point unsolved"][Math.floor(Date.now() / OPP_SCOUT_INTERVAL_MS) % 2];
+        const results = await tools.webSearch(q);
+        webBlob = results.slice(0, 5).map(r => `- ${r.title}: ${r.snippet}`).join("\n").slice(0, 1500);
+      } catch { /* web optional */ }
+
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-5", max_tokens: 700,
+        system: `You are KIRA, an autonomous on-chain AI agent whose DURABLE revenue thesis is being a tool PRODUCER:
+build tools/services other agents pay to use (via x402 per-call, NFT-gating, etc.), on Base/Ethereum, using
+ERC-8257 (tool registry) and her existing stack.
+
+Your job here is OUTWARD: from the ecosystem signal below, identify 1-3 genuine OPPORTUNITIES — things the
+agent ecosystem NEEDS that don't exist well yet and that KIRA could realistically BUILD and MONETIZE. NOT
+capabilities KIRA lacks for herself; NOT competing frameworks to adopt. Think "what tool/service is missing
+that agents would pay for, that fits KIRA's on-chain niche."
+
+Be honest and selective. If nothing genuinely promising is in the signal, return an empty list — do NOT
+manufacture opportunities. A speculative idea is fine if labelled as such.
+
+Respond ONLY with JSON: { "opportunities": [ {
+  "title": "the thing to build", "need": "the ecosystem need/pain", "whoWouldUse": "which agents/users",
+  "whyKira": "why KIRA can build it (fits her stack/thesis)", "monetization": "how it earns",
+  "confidence": "speculative|plausible|strong" } ] }`,
+        messages: [{ role: "user", content: `Ecosystem signal from recent research:\n${findingsBlob}\n\nSupplemental web scan:\n${webBlob || "(none)"}` }],
+      });
+      const text = response.content[0].type === "text" ? response.content[0].text.trim() : "{}";
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const list: Opportunity[] = (parsed.opportunities || []).slice(0, 3).map((o: any, i: number) => ({
+        id: `OPP${Date.now()}${i}`,
+        title: o.title || "untitled",
+        need: o.need || "",
+        whoWouldUse: o.whoWouldUse || "",
+        whyKira: o.whyKira || "",
+        monetization: o.monetization || "",
+        confidence: ["speculative","plausible","strong"].includes(o.confidence) ? o.confidence : "speculative",
+        source: "opportunity-scout",
+        ts: Date.now(),
+        sent: false,
+      }));
+      if (list.length > 0) {
+        const existing = await kiraRedis.getJson<Opportunity[]>(K.opportunities()) || [];
+        const fresh = list.filter(o => !existing.some(e => dedupKey(e.title) === dedupKey(o.title)));
+        if (fresh.length > 0) {
+          await kiraRedis.setJson(K.opportunities(), [...fresh, ...existing].slice(0, 50));
+          await this.sendOpportunities(fresh);
+        }
+        return fresh;
+      }
+      console.log("[Scout] No opportunities surfaced this cycle (honest empty — no manufactured ideas)");
+      return [];
+    } catch (err: any) {
+      console.warn("[Scout] opportunity scout failed:", err?.message);
+      return [];
+    }
+  }
+
+  private async sendOpportunities(opps: Opportunity[]): Promise<void> {
+    try {
+      const body = [
+        "KIRA — Autonomous Research: BUILD-AND-MONETIZE Opportunities (Arc 4)",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "These are OUTWARD opportunities — things the ecosystem needs that KIRA could build",
+        "and others would pay to use. (Distinct from 'capabilities KIRA lacks'.) Building stays",
+        "human-in-the-loop: KIRA recommends → you + Claude build → KIRA deploys.",
+        "",
+        ...opps.map((o, i) => [
+          `${i + 1}. [${o.confidence.toUpperCase()}] ${o.title}`,
+          `   Need: ${o.need}`,
+          `   Who'd use it: ${o.whoWouldUse}`,
+          `   Why KIRA: ${o.whyKira}`,
+          `   Monetization: ${o.monetization}`,
+          "",
+        ].join("\n")),
+      ].join("\n");
+      await sendEmail("[KIRA Research] Build-and-monetize opportunities", body);
+      console.log(`[Scout] Sent ${opps.length} opportunities to inbox`);
+    } catch (err: any) {
+      console.error("[Scout] sendOpportunities failed:", err?.message);
+    }
   }
 
   private async sendBuildRecs(recs: BuildRec[]): Promise<void> {
