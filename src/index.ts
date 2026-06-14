@@ -774,7 +774,9 @@ async function sendQualityReport(): Promise<void> {
     // there's at least one resolved call (or once a week regardless, to confirm liveness).
     const resolved = report.resolvedTotal;
     const lastSent = parseInt(await kiraRedis.get("kira:last_quality_report") || "0");
-    const weekElapsed = Date.now() - lastSent > 7 * 24 * 60 * 60 * 1000;
+    // Weekly liveness ping only AFTER a first real send — a from-zero timestamp must not
+    // count as "a week elapsed" (that bug emailed an empty report on every fresh deploy).
+    const weekElapsed = lastSent > 0 && (Date.now() - lastSent > 7 * 24 * 60 * 60 * 1000);
     if (resolved === 0 && !weekElapsed) return;   // nothing to say yet, and not the weekly liveness ping
 
     const body = callMetrics.format(report);
@@ -905,25 +907,43 @@ async function executePaperTrade(): Promise<void> {
 // arcs can let outcomes judge inputs. Conservative cadence enforced by cooldownStatus().
 async function executeConvictionCall(decision: Decision): Promise<void> {
   try {
-    const gate = await convictionCalls.cooldownStatus();
-    if (!gate.canCall) {
-      console.log(`[Call] Skipped — ${gate.reason}`);
-      // Don't waste the cycle: the LLM picked make_call but the call is blocked by
-      // cooldown/max-open. Fall through to useful mission work instead of idling.
+    // Pick KIRA's best available pick that clears the floor AND isn't on per-asset cooldown.
+    // (Relative best — we deliberately do NOT require score ≥ 70; the point is she commits
+    // to her best read even when the market offers nothing great. But with per-asset
+    // cooldowns she can build a book of DISTINCT calls, not just re-call one name.)
+    const watchlist = await portfolio.getWatchlist();
+    if (!watchlist.length) { console.log("[Call] No watchlist items to call on"); return; }
+    const ranked = [...watchlist].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0));
+
+    // Anti-burst / max-open first (asset-agnostic).
+    const burstGate = await convictionCalls.cooldownStatus();
+    if (!burstGate.canCall) {
+      console.log(`[Call] Skipped — ${burstGate.reason}`);
       const scanDue = (Date.now() - state.lastMarketScan) / 60000 >= 60;
       if (scanDue) { await scanMarketsForOpportunities(); }
-      else if (await researchLoop.isDue()) { /* research runs in backgroundTasks; just note */ state.recentLearnings.push("Call on cooldown — deferring to research/observe"); }
-      else { state.recentLearnings.push(`Call on cooldown: ${gate.reason}`); }
+      else { state.recentLearnings.push(`Call paced: ${burstGate.reason}`); }
       return;
     }
 
-    // KIRA's best available pick: highest-scoring watchlist item. (Relative best — we
-    // deliberately do NOT require score ≥ 70; the whole point is she commits to her best
-    // read even when the market offers nothing great.)
-    const watchlist = await portfolio.getWatchlist();
-    if (!watchlist.length) { console.log("[Call] No watchlist items to call on"); return; }
-    const candidate = [...watchlist].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0))[0];
-    if (!candidate || !candidate.lastScore) { console.log("[Call] No scored candidate"); return; }
+    // Walk down to the best candidate that clears the floor and isn't on per-asset cooldown.
+    let candidate = null as (typeof ranked)[number] | null;
+    for (const cand of ranked) {
+      if ((cand.lastScore || 0) < CALL_MIN_SCORE) break;  // rest are below floor
+      const g = await convictionCalls.cooldownStatus(cand.address);
+      if (g.canCall) { candidate = cand; break; }
+    }
+    if (!candidate) {
+      // Either nothing clears the floor, or all qualifying names are on per-asset cooldown.
+      const best = ranked[0];
+      if (best && (best.lastScore || 0) >= CALL_MIN_SCORE) {
+        console.log(`[Call] Skipped — qualifying setups on per-asset cooldown`);
+        state.recentLearnings.push("Call held: best setups already called recently");
+      } else {
+        await convictionCalls.recordAbstention(best ? best.lastScore || 0 : 0, `best available ${best?.name || "none"} @ ${best?.lastScore ?? 0} below floor ${CALL_MIN_SCORE}`);
+        state.recentLearnings.push(`Abstained: nothing clears floor ${CALL_MIN_SCORE} (best ${best?.lastScore ?? 0})`);
+      }
+      return;
+    }
 
     // Price it.
     let entryPrice = 0;
@@ -1260,6 +1280,25 @@ async function backgroundTasks(): Promise<void> {
     } catch (err: any) { console.error("Research loop error:", err?.message); }
   }
 
+  // ARC 4: outward opportunity scouting — runs on its own (slower) cadence. Asks "what does
+  // the ecosystem NEED that KIRA could build and monetize" rather than "what does KIRA lack".
+  // Produces build-and-monetize opportunity recs (human-in-the-loop to build). Uses the same
+  // Brave web search; gracefully no-ops if unavailable.
+  if (await researchLoop.isOppScoutDue()) {
+    try {
+      const opps = await researchLoop.scoutOpportunities({
+        webSearch: async (query: string) => {
+          const results = await webSearchClient.search(query, 8);
+          return results.length > 0 ? results : [];
+        },
+        webFetch: async (url: string) => { try { return await docs.readArbitraryUrl(url); } catch { return ""; } },
+        learningTerms: async () => [],
+        ingestToCorpus: async () => {},
+      });
+      if (opps.length > 0) state.recentLearnings.push(`Opportunity scout: ${opps.length} build-and-monetize idea(s) surfaced`);
+    } catch (err: any) { console.error("Opportunity scout error:", err?.message); }
+  }
+
   // A2A agent-to-agent messaging — poll inbound feed if configured, respond autonomously
   if (a2a.isReady() && now - state.lastA2ACheck > 20 * 60 * 1000) {
     try {
@@ -1509,23 +1548,35 @@ Respond ONLY with valid JSON:
       if (minutesSinceLastScan >= 60)
         return { action: "scan_markets", content: `Market scan (${modeNote})`, reasoning: `${modeNote} — redirecting to market analysis instead of posting` };
       // ARC 1: with nothing else due, this is the moment to exercise JUDGMENT — make a
-      // conviction call on the best available setup, IF cooldown is clear and there's a
-      // candidate that clears the minimum-quality floor. This is what stops KIRA from
-      // idling forever in observe; it routes her idle energy into owned, recorded calls.
-      const callGate = await convictionCalls.cooldownStatus();
-      if (callGate.canCall) {
-        const wl = await portfolio.getWatchlist();
-        const best = wl.length ? [...wl].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0))[0] : null;
-        if (best && (best.lastScore || 0) >= CALL_MIN_SCORE) {
-          return { action: "make_call", content: best.thesis || `Best available setup: ${best.name} at ${best.lastScore}/100`, reasoning: `${modeNote} — best setup (${best.name}, ${best.lastScore}/100) clears the quality floor; committing a conviction call instead of idling` };
-        }
-        // Best setup is below the floor — genuine abstention is the correct judgment.
-        // But RECORD it so "no good setups" is a visible decision, not invisible idling.
-        await convictionCalls.recordAbstention(best ? best.lastScore || 0 : 0, `best available ${best?.name || "none"} @ ${best?.lastScore ?? 0} below floor ${CALL_MIN_SCORE}`);
-        return { action: "observe", content: `No setup clears the bar (best ${best?.lastScore ?? 0}/100 < ${CALL_MIN_SCORE})`, reasoning: `${modeNote} — abstaining from a conviction call: nothing meets the quality floor right now. Recorded as a deliberate no-trade.` };
+      // conviction call on the best available setup that (a) clears the quality floor and
+      // (b) isn't the same asset she called recently. With per-asset cooldowns she can now
+      // build a book of DISTINCT calls rather than being globally blocked after one.
+      const wl = await portfolio.getWatchlist();
+      const ranked = wl.length ? [...wl].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0)) : [];
+      const best = ranked[0] || null;
+      // Anti-burst / max-open check first (asset-agnostic).
+      const burstGate = await convictionCalls.cooldownStatus();
+      if (!burstGate.canCall) {
+        return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — ${burstGate.reason}; brief observe` };
       }
-      // Cooldown active or max open — brief observe.
-      return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — ${callGate.reason}; brief observe` };
+      if (best && (best.lastScore || 0) >= CALL_MIN_SCORE) {
+        // Walk down the ranked list to the best candidate that ISN'T on per-asset cooldown.
+        let chosen = null as (typeof ranked)[number] | null;
+        for (const cand of ranked) {
+          if ((cand.lastScore || 0) < CALL_MIN_SCORE) break;  // rest are below floor
+          const g = await convictionCalls.cooldownStatus(cand.address);
+          if (g.canCall) { chosen = cand; break; }
+        }
+        if (chosen) {
+          return { action: "make_call", content: chosen.thesis || `Best available setup: ${chosen.name} at ${chosen.lastScore}/100`, reasoning: `${modeNote} — best eligible setup (${chosen.name}, ${chosen.lastScore}/100) clears the quality floor; committing a conviction call instead of idling` };
+        }
+        // Everything above the floor is on per-asset cooldown — fine, hold.
+        return { action: "observe", content: `Heads-down (${modeNote})`, reasoning: `${modeNote} — qualifying setups are all on per-asset cooldown; holding existing calls` };
+      }
+      // Best setup is below the floor — genuine abstention is the correct judgment.
+      // But RECORD it so "no good setups" is a visible decision, not invisible idling.
+      await convictionCalls.recordAbstention(best ? best.lastScore || 0 : 0, `best available ${best?.name || "none"} @ ${best?.lastScore ?? 0} below floor ${CALL_MIN_SCORE}`);
+      return { action: "observe", content: `No setup clears the bar (best ${best?.lastScore ?? 0}/100 < ${CALL_MIN_SCORE})`, reasoning: `${modeNote} — abstaining from a conviction call: nothing meets the quality floor right now. Recorded as a deliberate no-trade.` };
     }
 
     // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
