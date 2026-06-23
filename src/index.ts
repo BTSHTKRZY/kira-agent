@@ -30,6 +30,7 @@ import { KiraMemory } from "./memory.js";
 import { KiraShadowTrading } from "./shadowtrading.js";
 import { KiraConvictionCalls } from "./convictioncalls.js";
 import { KiraCallMetrics } from "./callmetrics.js";
+import { KiraSourceLearning } from "./sourcelearning.js";
 import { KiraSpendLimit } from "./spendlimit.js";
 import { KiraAgentNetwork } from "./agentnetwork.js";
 import { KiraA2A } from "./a2a.js";
@@ -279,9 +280,11 @@ interface KiraState {
   coreLearnings:        string;
   corpusKnowledge:      string;
   lastRetrievedKnowledge: Array<{ id: string; source: string }>;
+  knowledgeRetrievalDegraded: boolean;
   relationships:        string;
   shadowSummary:        string;
   callTrackRecord:      string;
+  sourceLearningSummary: string;
   a2aSummary:           string;
   lastA2ACheck:         number;
   researchSummary:      string;
@@ -348,9 +351,11 @@ const state: KiraState = {
   coreLearnings:         "",
   corpusKnowledge:       "",
   lastRetrievedKnowledge: [],
+  knowledgeRetrievalDegraded: false,
   relationships:         "",
   shadowSummary:         "",
   callTrackRecord:        "",
+  sourceLearningSummary:  "",
   a2aSummary:            "",
   lastA2ACheck:          0,
   researchSummary:       "",
@@ -405,6 +410,7 @@ const memory           = new KiraMemory();
 const shadowTrading    = new KiraShadowTrading();
 const convictionCalls  = new KiraConvictionCalls();
 const callMetrics      = new KiraCallMetrics();
+const sourceLearning   = new KiraSourceLearning();
 const spendLimit       = new KiraSpendLimit();
 const agentNetwork     = new KiraAgentNetwork();
 const a2a              = new KiraA2A();
@@ -780,7 +786,8 @@ async function sendQualityReport(): Promise<void> {
     if (resolved === 0 && !weekElapsed) return;   // nothing to say yet, and not the weekly liveness ping
 
     const body = callMetrics.format(report);
-    await sendEmail("KIRA — Decision Quality Report", body);
+    const arc3 = await sourceLearning.formatForContext();
+    await sendEmail("KIRA — Decision Quality Report", body + "\n\n" + arc3);
     state.lastQualityReport = Date.now();
     await kiraRedis.set("kira:last_quality_report", String(state.lastQualityReport));
     console.log(`[Quality] Report sent — ${resolved} resolved calls`);
@@ -969,6 +976,7 @@ async function executeConvictionCall(decision: Decision): Promise<void> {
     const attribution = {
       knowledgeIds:     state.lastRetrievedKnowledge.map(k => k.id),
       knowledgeSources: Array.from(new Set(state.lastRetrievedKnowledge.map(k => k.source))),
+      degraded:         state.knowledgeRetrievalDegraded || undefined,
       signals:          candidate.signals || {},
     };
 
@@ -1087,11 +1095,12 @@ async function backgroundTasks(): Promise<void> {
     } catch (err: any) { console.error("Shadow resolve error:", err?.message); }
   }
 
-  // ARC 1: Resolve matured CONVICTION CALLS (KIRA's owned decisions) into her track
-  // record. Separate from shadows — these are calls she chose, judged against real price.
-  if (now - state.lastCallResolve > 2 * 60 * 60 * 1000) {
+  // ARC-B: Resolve CONVICTION CALLS — condition-based (target/stop/horizon/max-age), checked
+  // frequently (~20min) so a stop or target triggers promptly rather than waiting on a timer.
+  // The max-age force-close inside resolveCalls is what ended the 6-day 5/5 deadlock.
+  if (now - state.lastCallResolve > 20 * 60 * 1000) {
     try {
-      const res = await convictionCalls.resolveMatured(async (c) => {
+      const res = await convictionCalls.resolveCalls(async (c) => {
         if (c.type === "nft") { const col = await nfts.getCollection(c.address, c.chain); return col?.floorPrice ?? null; }
         const p = await prices.getTokenPrice(c.address, c.chain); return p?.priceNative ?? null;
       });
@@ -1101,6 +1110,14 @@ async function backgroundTasks(): Promise<void> {
         console.log(`[Call] Resolved ${res.resolved}: ${res.notes.join(" | ")}`);
         console.log(`[Call] ${tr}`);
         state.recentLearnings.push(`Calls resolved: ${res.notes.join(" | ")}`);
+        // ARC 3: a call resolved → recompute source weights (sample-gated; does nothing
+        // until a source has ≥8 resolved calls, so it accumulates safely without thrashing).
+        try {
+          const allCalls = await convictionCalls.getAllCalls();
+          const upd = await sourceLearning.update(allCalls);
+          if (upd.changed) console.log(`[Arc3] ${upd.summary}`);
+          state.sourceLearningSummary = await sourceLearning.formatForContext();
+        } catch (err: any) { console.error("Arc3 update error:", err?.message); }
       }
     } catch (err: any) { console.error("Call resolve error:", err?.message); }
   }
@@ -1362,10 +1379,32 @@ async function backgroundTasks(): Promise<void> {
     ].join(" ");
     state.coreLearnings = await memory.getRelevantLearningsForContext(relevanceContext);
     // L2 + ARC1: retrieve corpus knowledge AND capture which items/sources fed the
-    // decision, so a conviction call can record its attribution.
-    const kRetrieval = await knowledge.getRelevantKnowledgeWithItems(relevanceContext, "main_cycle");
-    state.corpusKnowledge = kRetrieval.text;
-    state.lastRetrievedKnowledge = kRetrieval.items.map(i => ({ id: i.id, source: i.source }));
+    // decision, so a conviction call can record its attribution. If retrieval THROWS
+    // (e.g. a Vector timeout cascading past the lexical fallback), mark the attribution
+    // degraded so Arc 2/3 exclude it rather than miscounting it as "no knowledge used".
+    try {
+      const kRetrieval = await knowledge.getRelevantKnowledgeWithItems(relevanceContext, "main_cycle");
+      // ARC 3: re-rank retrieved items by learned source weight — favor sources that have
+      // historically led to good calls. Weights are neutral (1.0) until a source passes the
+      // sample gate, so this is a no-op until there's enough resolved-call data to mean
+      // something. Re-ranking only reorders WHICH retrieved items lead; it doesn't fabricate.
+      let items = kRetrieval.items;
+      try {
+        const weighted = await Promise.all(items.map(async (it) => ({
+          it, w: await sourceLearning.weightFor(it.source),
+        })));
+        weighted.sort((a, b) => b.w - a.w);
+        items = weighted.map(x => x.it);
+      } catch { /* weighting optional — fall back to original order */ }
+      state.corpusKnowledge = kRetrieval.text;
+      state.lastRetrievedKnowledge = items.map(i => ({ id: i.id, source: i.source }));
+      state.knowledgeRetrievalDegraded = false;
+    } catch (err: any) {
+      console.warn("[Knowledge] retrieval failed, attribution degraded:", err?.message);
+      state.corpusKnowledge = "Corpus retrieval failed this cycle.";
+      state.lastRetrievedKnowledge = [];
+      state.knowledgeRetrievalDegraded = true;
+    }
   }
   state.relationships = await memory.getRelationshipsForContext();
   state.shadowSummary = await shadowTrading.formatForContext();
@@ -1498,7 +1537,7 @@ AVAILABLE ACTIONS:
 - scan_tools: scan ERC-8257 registry
 - scan_markets: scan markets
 - paper_trade: open paper trade on item above score 55
-- make_call: commit a CONVICTION CALL — your single best owned pick of everything you can see right now, even if nothing scores above 70. State a clear thesis and conviction (low/medium/high). This is YOUR judgment on the line, recorded into your track record and resolved against real price. Make these deliberately — a few a week, your genuine best read, not filler. Prefer this over endless observing when you have a real view on what's most likely to move.
+- make_call: commit a CONVICTION CALL — your single best owned pick of everything you can see right now, even if nothing scores above 70. State a clear thesis and conviction (low/medium/high). This is YOUR judgment on the line, recorded into your track record and resolved against real price (it resolves when it hits your target, hits your stop, or your thesis plays out — not on a fixed timer). Reason about it like a disciplined trader assessing EDGE: what's the specific catalyst, what's the risk, why is the current price wrong, what would prove you wrong. Do NOT justify a call by how "differentiated", "non-obvious", or "credible" it makes you look, or whether it "makes your feed worth following" — you are judged ONLY on whether the call is right, not on how it sounds. Audience-impressiveness is irrelevant; expected edge is everything. Make calls deliberately, your genuine best read, not filler. Prefer this over endless observing when you have a real, falsifiable view on what's most likely to move.
 - review_watchlist: review watchlist
 - observe: record internal observation
 - sleep: rest N minutes
