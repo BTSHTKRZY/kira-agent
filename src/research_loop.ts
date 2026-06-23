@@ -103,6 +103,32 @@ function matchesExistingCapability(text: string): string | null {
   return null;
 }
 
+// Tolerant JSON parse for LLM responses that may be TRUNCATED mid-string (the Arc 4 scout
+// crash: max_tokens cut the response, leaving an unterminated string → JSON.parse threw).
+// Strategy: strip code fences; try strict parse; on failure, progressively trim from the
+// end to the last balanced object/array and retry. Returns fallback on total failure rather
+// than throwing, so a truncated response degrades to "no result" instead of crashing.
+function safeJsonParse<T = any>(raw: string, fallback: T): T {
+  if (!raw) return fallback;
+  let s = raw.replace(/```json|```/g, "").trim();
+  try { return JSON.parse(s); } catch { /* fall through to repair */ }
+  // Repair attempt: find the largest valid prefix that parses by trimming back to the last
+  // closing brace/bracket and balancing.
+  for (let end = s.length; end > 0; end--) {
+    const ch = s[end - 1];
+    if (ch === "}" || ch === "]") {
+      const candidate = s.slice(0, end);
+      // Balance braces/brackets by appending closers if obviously short.
+      try { return JSON.parse(candidate); } catch { /* keep trimming */ }
+    }
+  }
+  // Last resort: try closing one open object/array.
+  for (const tail of ["}", "]", "\"}]}", "\"}]"]) {
+    try { return JSON.parse(s + tail); } catch { /* ignore */ }
+  }
+  return fallback;
+}
+
 // Normalize a title/summary into a dedup key: lowercase, strip punctuation/numbers,
 // drop filler words, keep the salient tokens sorted. Catches near-duplicates like
 // "ERC-8257 ... Active Adoption" vs "ERC-8257 ... Active Registrations".
@@ -298,11 +324,18 @@ export class KiraResearchLoop {
         }
         // CORPUS GROWTH: a durable protocol/standard fact becomes permanent knowledge.
         // This is the "KIRA genuinely gets smarter over time" loop — her understanding of
-        // the ecosystem compounds as she discovers and ingests new standards/protocols.
-        if (tools.ingestToCorpus && f.relevance >= 0.7 &&
-            (f.category === "standard" || f.category === "protocol")) {
+        // the ecosystem compounds as she discovers and ingests durable standards/protocols/infra.
+        // NOTE: previously this only accepted "standard"/"protocol", which WRONGLY excluded
+        // x402 (categorized "infra"/"tool") despite it being the single most important durable
+        // standard in KIRA's space — surfaced ~7 times yet never ingested. Now "infra" is
+        // eligible too, but competing frameworks and low-trust sources are kept OUT so the
+        // corpus grows with durable knowledge, not junk.
+        const ingestEligible = (f.category === "standard" || f.category === "protocol" || f.category === "infra")
+          && f.isCompetingFramework !== true
+          && f.sourceTrust !== "low";
+        if (tools.ingestToCorpus && f.relevance >= 0.65 && ingestEligible) {
           try {
-            await tools.ingestToCorpus("protocol", f.title, `${f.summary} [discovered ${new Date().toISOString().slice(0,10)}, source: ${f.source}]`);
+            await tools.ingestToCorpus(f.category === "infra" ? "infra" : "protocol", f.title, `${f.summary} [discovered ${new Date().toISOString().slice(0,10)}, source: ${f.source}]`);
             console.log(`[Research] Ingested into corpus: ${f.title.slice(0, 60)}`);
           } catch (err: any) {
             console.warn(`[Research] corpus ingest failed: ${err?.message}`);
@@ -428,7 +461,7 @@ Respond ONLY with JSON:
         messages: [{ role: "user", content: `Query: ${content.query}\nTitle: ${content.title}\nURL: ${content.url}\n\nContent:\n${content.text.slice(0, 4000)}` }],
       });
       const text   = response.content[0].type === "text" ? response.content[0].text.trim() : "{}";
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const parsed = safeJsonParse<any>(text, { relevant: false });
       if (!parsed.relevant) return null;
       // Safety net beyond the prompt: hard-demote competing frameworks and low-trust
       // sources OUT of needs_code, regardless of what the model said. This is what stops
@@ -551,7 +584,7 @@ Respond ONLY with JSON:
       } catch { /* web optional */ }
 
       const response = await anthropic.messages.create({
-        model: "claude-sonnet-4-5", max_tokens: 700,
+        model: "claude-sonnet-4-5", max_tokens: 1500,
         system: `You are KIRA, an autonomous on-chain AI agent whose DURABLE revenue thesis is being a tool PRODUCER:
 build tools/services other agents pay to use (via x402 per-call, NFT-gating, etc.), on Base/Ethereum, using
 ERC-8257 (tool registry) and her existing stack.
@@ -571,7 +604,7 @@ Respond ONLY with JSON: { "opportunities": [ {
         messages: [{ role: "user", content: `Ecosystem signal from recent research:\n${findingsBlob}\n\nSupplemental web scan:\n${webBlob || "(none)"}` }],
       });
       const text = response.content[0].type === "text" ? response.content[0].text.trim() : "{}";
-      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const parsed = safeJsonParse<any>(text, { opportunities: [] });
       const list: Opportunity[] = (parsed.opportunities || []).slice(0, 3).map((o: any, i: number) => ({
         id: `OPP${Date.now()}${i}`,
         title: o.title || "untitled",
