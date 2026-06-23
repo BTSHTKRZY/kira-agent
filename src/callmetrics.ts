@@ -104,8 +104,11 @@ export class KiraCallMetrics {
     const overall  = statFromCalls(resolved);
 
     // ── KNOWLEDGE LIFT ────────────────────────────────────────────────────────
-    const withK    = resolved.filter(c => (c.attribution?.knowledgeIds?.length || 0) > 0);
-    const withoutK = resolved.filter(c => (c.attribution?.knowledgeIds?.length || 0) === 0);
+    // Exclude calls whose attribution is DEGRADED (retrieval failed) — counting them as
+    // "no knowledge used" would corrupt the comparison.
+    const reliable = resolved.filter(c => c.attribution?.degraded !== true);
+    const withK    = reliable.filter(c => (c.attribution?.knowledgeIds?.length || 0) > 0);
+    const withoutK = reliable.filter(c => (c.attribution?.knowledgeIds?.length || 0) === 0);
     const gWith    = statFromCalls(withK);
     const gWithout = statFromCalls(withoutK);
     let liftPct: number | null = null;
@@ -125,6 +128,7 @@ export class KiraCallMetrics {
     // Each resolved call credits/debits every source that fed it.
     const bySource: Record<string, ConvictionCall[]> = {};
     for (const c of resolved) {
+      if (c.attribution?.degraded === true) continue;  // unreliable attribution — skip
       const sources = c.attribution?.knowledgeSources || [];
       for (const s of sources) {
         (bySource[s] ||= []).push(c);
