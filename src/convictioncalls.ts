@@ -30,6 +30,9 @@ export interface CallAttribution {
   knowledgeIds:     string[];   // corpus item ids retrieved into this decision
   knowledgeSources: string[];   // their sources ("seed" | "promoted_learning" | "ingested")
   signals:          Record<string, number>;  // the scoring signals that drove it
+  degraded?:        boolean;    // true if knowledge retrieval FAILED (e.g. Vector timeout) —
+                                // attribution is unreliable; Arc 2/3 should exclude from
+                                // knowledge-lift/source-yield rather than count as "no knowledge used"
 }
 
 export interface ConvictionCall {
@@ -44,7 +47,10 @@ export interface ConvictionCall {
   conviction:   "low" | "medium" | "high";
   entryPrice:   number;
   entryTime:    number;
-  horizonDays:  number;
+  horizonDays:  number;        // thesis-appropriate soft horizon (resolve by this if nothing else triggers)
+  // ARC-B: condition-based resolution targets (resolve when ANY triggers, not a fixed timer).
+  targetPct?:   number;        // take-profit: thesis proven if price rises this % (e.g. +20)
+  stopPct?:     number;        // stop: thesis invalidated if price falls this % (e.g. -15), stored as negative
   // Attribution (load-bearing for Arcs 2-3)
   attribution:  CallAttribution;
   // Outcome (filled on resolution)
@@ -53,6 +59,7 @@ export interface ConvictionCall {
   exitTime?:    number;
   pnlPct?:      number;
   outcome?:     "win" | "loss" | "flat";
+  resolveReason?: "target_hit" | "stop_hit" | "horizon" | "max_age_forced" | "unpriceable_forced";
   resolveNote?: string;
 }
 
@@ -89,8 +96,16 @@ const K = {
 // she can make several calls, but only on setups that clear the bar.
 const CALL_BURST_GAP_MS     = parseInt(process.env.CALL_BURST_GAP_MS     || String(3 * 60 * 60 * 1000));  // ~3h between ANY two calls
 const CALL_ASSET_COOLDOWN_MS= parseInt(process.env.CALL_ASSET_COOLDOWN_MS|| String(36 * 60 * 60 * 1000)); // ~36h before re-calling the SAME asset
-const MAX_OPEN_CALLS        = parseInt(process.env.MAX_OPEN_CALLS        || "5");
-const DEFAULT_HORIZON       = parseInt(process.env.CALL_HORIZON_DAYS     || "7");
+const MAX_OPEN_CALLS        = parseInt(process.env.MAX_OPEN_CALLS        || "8");   // raised from 5 — pacing/floor are the real discipline
+const DEFAULT_HORIZON       = parseInt(process.env.CALL_HORIZON_DAYS     || "4");   // shorter soft horizon — crypto/NFT moves fast; 7d was an eternity
+// ARC-B condition-based resolution: a call resolves when ANY of these triggers, not on a
+// fixed timer. Defaults are sensible for a fast market; conviction can scale them later.
+const DEFAULT_TARGET_PCT    = parseFloat(process.env.CALL_TARGET_PCT     || "20");  // +20% → thesis proven, book the win
+const DEFAULT_STOP_PCT      = parseFloat(process.env.CALL_STOP_PCT       || "-15"); // -15% → thesis invalidated, book the loss
+// CRITICAL anti-deadlock guard: a call MUST resolve by this hard age no matter what, even
+// if it can't be priced. The old code pushed unpriceable calls back to "open" forever,
+// which paralysed KIRA at 5/5 for 6 days. Nothing hangs open past this.
+const CALL_MAX_AGE_MS       = parseInt(process.env.CALL_MAX_AGE_MS       || String(10 * 24 * 60 * 60 * 1000)); // 10 days hard cap
 const FLAT_BAND_PCT      = 2;     // |pnl| < 2% counts as "flat", not win/loss
 // Same data-artifact guard the shadow system uses: a >±500% short-horizon move on a
 // tracked asset is a mis-scaled/near-zero price, not a real move. Don't let it pollute
@@ -152,9 +167,14 @@ export class KiraConvictionCalls {
     entryPrice: number;
     attribution: CallAttribution;
     horizonDays?: number;
+    targetPct?: number;
+    stopPct?: number;
   }): Promise<ConvictionCall | null> {
     if (!params.entryPrice || params.entryPrice <= 0) return null;
     const id = await this.nextId();
+    // Conviction scales the target: higher conviction → wider target (more upside expected),
+    // but the stop stays tight regardless (risk discipline doesn't loosen with confidence).
+    const convMult = params.conviction === "high" ? 1.5 : params.conviction === "medium" ? 1.0 : 0.7;
     const call: ConvictionCall = {
       id,
       type:        params.type,
@@ -167,6 +187,8 @@ export class KiraConvictionCalls {
       entryPrice:  params.entryPrice,
       entryTime:   Date.now(),
       horizonDays: params.horizonDays || DEFAULT_HORIZON,
+      targetPct:   params.targetPct ?? (DEFAULT_TARGET_PCT * convMult),
+      stopPct:     params.stopPct ?? DEFAULT_STOP_PCT,
       attribution: params.attribution,
       resolved:    false,
     };
@@ -181,9 +203,16 @@ export class KiraConvictionCalls {
     return call;
   }
 
-  // ── RESOLVE matured calls against real price ────────────────────────────────
-  // priceLookup returns the current price for a call's asset, or null if unavailable.
-  async resolveMatured(
+  // ── RESOLVE calls — CONDITION-BASED, not a fixed timer ──────────────────────
+  // A call resolves when ANY trigger fires, checked every cycle:
+  //   • target_hit   — price ≥ entry*(1+target%)  → thesis proven, win
+  //   • stop_hit     — price ≤ entry*(1+stop%)    → thesis invalidated, loss
+  //   • horizon      — soft thesis horizon elapsed → resolve at whatever price is
+  //   • max_age      — HARD cap: resolve no matter what, even if unpriceable (anti-deadlock)
+  // The max_age guard is the fix for the 6-day paralysis: the old code pushed unpriceable
+  // calls back to "open" FOREVER, so dead micro-caps (DOGEUS et al.) never resolved and
+  // capped her at 5/5 indefinitely. Now nothing hangs open past CALL_MAX_AGE_MS.
+  async resolveCalls(
     priceLookup: (c: ConvictionCall) => Promise<number | null>
   ): Promise<{ resolved: number; notes: string[] }> {
     const open = await kiraRedis.getJson<string[]>(K.open()) || [];
@@ -195,40 +224,76 @@ export class KiraConvictionCalls {
     for (const id of open) {
       const call = await kiraRedis.getJson<ConvictionCall>(K.call(id));
       if (!call || call.resolved) continue;
-      const matured = Date.now() - call.entryTime >= call.horizonDays * 24 * 60 * 60 * 1000;
-      if (!matured) { stillOpen.push(id); continue; }
+
+      const age          = Date.now() - call.entryTime;
+      const horizonMs    = call.horizonDays * 24 * 60 * 60 * 1000;
+      const horizonPassed= age >= horizonMs;
+      const overMaxAge   = age >= CALL_MAX_AGE_MS;
 
       const price = await priceLookup(call);
-      if (price === null || price === undefined) {
-        // Can't price it yet — keep it open, try next cycle.
+
+      // ── ANTI-DEADLOCK: unpriceable AND over hard max age → force-close, free the slot.
+      if ((price === null || price === undefined)) {
+        if (overMaxAge) {
+          call.resolved = true;
+          call.exitTime = Date.now();
+          call.pnlPct = 0;
+          call.outcome = "flat";
+          call.resolveReason = "unpriceable_forced";
+          call.resolveNote = "force-closed: unpriceable past max age (asset likely dead/delisted) — excluded from P&L";
+          await kiraRedis.setJson(K.call(id), call);
+          notes.push(`${call.name}: force-closed (unpriceable, dead asset)`);
+          resolved++;
+          continue;
+        }
+        // Not yet at max age — keep trying to price it, but it WILL close at max age.
         stillOpen.push(id);
         continue;
       }
+
       const pnl = this.safePnlPct(call.entryPrice, price);
       if (pnl === null) {
-        // Implausible/corrupted price — resolve as flat with a note so it doesn't poison stats.
-        call.resolved = true;
-        call.exitPrice = price;
-        call.exitTime = Date.now();
-        call.pnlPct = 0;
-        call.outcome = "flat";
-        call.resolveNote = "excluded from P&L — implausible price (data artifact)";
-        await kiraRedis.setJson(K.call(id), call);
-        notes.push(`${call.name}: excluded (bad price)`);
-        resolved++;
+        // Implausible price — only force-resolve if also past horizon/max-age, else retry.
+        if (horizonPassed || overMaxAge) {
+          call.resolved = true; call.exitPrice = price; call.exitTime = Date.now();
+          call.pnlPct = 0; call.outcome = "flat";
+          call.resolveReason = "max_age_forced";
+          call.resolveNote = "excluded from P&L — implausible price (data artifact)";
+          await kiraRedis.setJson(K.call(id), call);
+          notes.push(`${call.name}: excluded (bad price)`);
+          resolved++;
+        } else {
+          stillOpen.push(id);
+        }
         continue;
       }
-      call.resolved  = true;
-      call.exitPrice = price;
-      call.exitTime  = Date.now();
-      call.pnlPct    = pnl;
-      call.outcome   = pnl > FLAT_BAND_PCT ? "win" : pnl < -FLAT_BAND_PCT ? "loss" : "flat";
+
+      // ── CONDITION CHECKS (target / stop / horizon / max-age) ──
+      let reason: ConvictionCall["resolveReason"] | null = null;
+      if (call.targetPct !== undefined && pnl >= call.targetPct)      reason = "target_hit";
+      else if (call.stopPct !== undefined && pnl <= call.stopPct)     reason = "stop_hit";
+      else if (overMaxAge)                                            reason = "max_age_forced";
+      else if (horizonPassed)                                         reason = "horizon";
+
+      if (!reason) { stillOpen.push(id); continue; }   // no trigger yet — keep holding
+
+      call.resolved   = true;
+      call.exitPrice  = price;
+      call.exitTime   = Date.now();
+      call.pnlPct     = pnl;
+      call.outcome    = pnl > FLAT_BAND_PCT ? "win" : pnl < -FLAT_BAND_PCT ? "loss" : "flat";
+      call.resolveReason = reason;
       await kiraRedis.setJson(K.call(id), call);
-      notes.push(`${call.name}: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}% (${call.outcome})`);
+      notes.push(`${call.name}: ${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}% (${call.outcome}, ${reason})`);
       resolved++;
     }
     await kiraRedis.setJson(K.open(), stillOpen);
     return { resolved, notes };
+  }
+
+  // Back-compat alias (index.ts may still call resolveMatured).
+  async resolveMatured(priceLookup: (c: ConvictionCall) => Promise<number | null>) {
+    return this.resolveCalls(priceLookup);
   }
 
   // ── ABSTENTION: a deliberate no-trade is also a decision ────────────────────
