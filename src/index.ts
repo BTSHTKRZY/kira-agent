@@ -1101,8 +1101,18 @@ async function backgroundTasks(): Promise<void> {
   if (now - state.lastCallResolve > 20 * 60 * 1000) {
     try {
       const res = await convictionCalls.resolveCalls(async (c) => {
-        if (c.type === "nft") { const col = await nfts.getCollection(c.address, c.chain); return col?.floorPrice ?? null; }
-        const p = await prices.getTokenPrice(c.address, c.chain); return p?.priceNative ?? null;
+        // CRITICAL: guard EACH lookup. A throw here (fetch timeout, dead-token JSON parse
+        // error, network blip — common during AWS incidents) must NOT propagate, or it
+        // aborts the entire resolution batch and NO call ever resolves. That was the bug
+        // that kept her deadlocked at 8/8: one bad asset poisoned every cycle. On any
+        // error, return null (resolver treats null as "unpriceable, hold until max-age").
+        try {
+          if (c.type === "nft") { const col = await nfts.getCollection(c.address, c.chain); return col?.floorPrice ?? null; }
+          const p = await prices.getTokenPrice(c.address, c.chain); return p?.priceNative ?? null;
+        } catch (e: any) {
+          console.warn(`[Call] price lookup failed for ${c.name}: ${e?.message} — treating as unpriceable`);
+          return null;
+        }
       });
       state.lastCallResolve = now;
       if (res.resolved > 0) {
