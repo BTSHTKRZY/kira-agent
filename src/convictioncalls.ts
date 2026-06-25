@@ -230,7 +230,9 @@ export class KiraConvictionCalls {
       const horizonPassed= age >= horizonMs;
       const overMaxAge   = age >= CALL_MAX_AGE_MS;
 
-      const price = await priceLookup(call);
+      let price: number | null = null;
+      try { price = await priceLookup(call); }
+      catch { price = null; }   // defense-in-depth: never let one lookup abort the batch
 
       // ── ANTI-DEADLOCK: unpriceable AND over hard max age → force-close, free the slot.
       if ((price === null || price === undefined)) {
