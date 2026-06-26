@@ -767,52 +767,6 @@ async function sendWeeklyReport(): Promise<void> {
   } catch (err: any) { console.error("Weekly report error:", err?.message); }
 }
 
-// ── PAPER TRADING ─────────────────────────────────────────────────────────────
-
-async function executePaperTrade(): Promise<void> {
-  try {
-    const watchlist = await portfolio.getWatchlist();
-    if (!watchlist.length) return;
-    // Lowered threshold to 55 to generate paper trade data
-    const candidate = watchlist.find(item => item.lastScore >= 55);
-    if (!candidate) { console.log("No item above threshold (55)"); return; }
-
-    let entryPrice = 0;
-    if (candidate.type === "nft") {
-      const col  = await nfts.getCollection(candidate.address, candidate.chain);
-      entryPrice = col?.floorPrice || 0;
-    } else {
-      const price = await prices.getTokenPrice(candidate.address, candidate.chain);
-      entryPrice  = price?.priceNative || 0;
-    }
-    if (!entryPrice) return;
-
-    const mockScore = {
-      collection: candidate.address, address: candidate.address,
-      symbol: candidate.symbol || "", chain: candidate.chain,
-      totalScore: candidate.lastScore, thesis: candidate.thesis,
-      signals: candidate.signals, decision: "buy" as const,
-      confidence: "medium" as const, scoredAt: candidate.scoredAt,
-    };
-
-    const pos = await portfolio.openPosition(mockScore, candidate.name, "paper", candidate.tokenId);
-    await portfolio.setEntryPrice(pos.id, entryPrice);
-    await portfolio.removeFromWatchlist(candidate.key);
-    state.paperTradeCount++;
-    state.recentLearnings.push(`Paper: ${candidate.name} @ ${entryPrice.toFixed(4)} ETH | ${candidate.lastScore}/100`);
-    await memory.journal("decision", `Opened paper trade: ${candidate.name} at ${candidate.lastScore}/100`, candidate.thesis.slice(0, 100));
-
-    // Broadcast to other agents
-    await multiAgent.broadcastSignal({
-      type: "watch", asset: candidate.name, chain: candidate.chain,
-      confidence: candidate.lastScore / 100,
-      reasoning:  candidate.thesis.slice(0, 150),
-    });
-
-    state.recentPostTopics.push("paper_trade");
-  } catch (err: any) { console.error("Paper trade error:", err?.message); }
-}
-
 // ── ARC 1: CONVICTION CALL — KIRA's owned decision, recorded with attribution ──
 // Picks her single best available pick (relative best — even in a fearful market where
 // nothing scores high), prices it, and records it as an owned call that resolves into
@@ -902,6 +856,15 @@ async function executeConvictionCall(decision: Decision): Promise<void> {
     console.log(`[Call] ✓ CONVICTION CALL: ${candidate.name} @ ${entryPrice} | score ${candidate.lastScore} | conviction ${conviction} | knowledge:[${attribution.knowledgeIds.join(",") || "none"}] sources:[${attribution.knowledgeSources.join(",") || "none"}]`);
     state.recentLearnings.push(`Conviction call: ${candidate.name} @ ${candidate.lastScore}/100 (${conviction}) — ${thesis.slice(0, 80)}`);
     await memory.journal("decision", `Conviction call: ${candidate.name} at ${candidate.lastScore}/100 (${conviction} conviction)`, thesis.slice(0, 120));
+    // A2A: broadcast the call to the agent network (moved here from the removed paper_trade
+    // path — a deliberate conviction call is better signal to peers than an old >55 auto-open).
+    try {
+      await multiAgent.broadcastSignal({
+        type: "watch", asset: candidate.name, chain: candidate.chain,
+        confidence: candidate.lastScore / 100,
+        reasoning:  thesis.slice(0, 150),
+      });
+    } catch {}
   } catch (err: any) { console.error("Conviction call error:", err?.message); }
 }
 
@@ -1286,7 +1249,7 @@ async function backgroundTasks(): Promise<void> {
 
 type Action =
   | "check_wallet"
-  | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade" | "make_call"
+  | "read_docs" | "scan_tools" | "scan_markets" | "make_call"
   | "review_watchlist" | "observe" | "sleep" | "research_now";
 
 interface Decision {
@@ -1297,20 +1260,6 @@ interface Decision {
   theme?:     string;   // required for post/post_thread — one of the fixed POST_THEMES
   reasoning?: string;
 }
-
-// Fixed set of post themes — KIRA must rotate through these, not cluster on two
-const POST_THEMES = [
-  "market_observation",   // specific NFT/token data
-  "smart_money",          // what verified wallets are doing
-  "macro_thesis",         // CPI/Fed/dominance positioning
-  "pattern_recognition",  // cross-dataset patterns KIRA notices
-  "cross_chain",          // Arbitrum/Solana/Base observations
-  "agent_ecosystem",      // other agents, ERC-8257, tool gaps
-  "philosophical",        // on-chain existence, autonomy, being awakened
-  "tool_intelligence",    // KIRA's own tools, registry observations
-  "paper_trade",          // specific position thesis
-  "learning_reflection",  // what KIRA has learned over time
-] as const;
 
 async function decide(context: string): Promise<Decision> {
   const minutesSinceLastPost   = state.lastPostTime > 0 ? Math.floor((Date.now() - state.lastPostTime) / 60000) : 999;
@@ -1505,11 +1454,6 @@ async function execute(decision: Decision): Promise<void> {
       case "scan_markets":
         await scanMarketsForOpportunities();
         await sleep(2 * 60 * 1000);
-        break;
-
-      case "paper_trade":
-        await executePaperTrade();
-        await sleep(5 * 60 * 1000);
         break;
 
       case "make_call":
