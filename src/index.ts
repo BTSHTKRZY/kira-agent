@@ -2,7 +2,6 @@ import Anthropic from "@anthropic-ai/sdk";
 import * as dotenv from "dotenv";
 dotenv.config();
 
-import { KiraTwitter }        from "./twitter.js";
 import { KiraOnchain }        from "./onchain.js";
 import { KiraTools }          from "./tools.js";
 import { KiraDocs }           from "./docs.js";
@@ -23,7 +22,6 @@ import { KiraAave }           from "./aave.js";
 import { KiraCrossChain }     from "./crosschain.js";
 import { KiraMultiAgent }     from "./multiagent.js";
 import { KiraToolDeployment } from "./tooldeployment.js";
-import { KiraLongForm }       from "./longform.js";
 import { startDashboard, updateDashboard } from "./dashboard.js";
 import { startToolDataServer } from "./tooldata.js";
 import { KiraMemory } from "./memory.js";
@@ -43,22 +41,10 @@ import { kiraRedis } from "./redis.js";
 const KIRA_WALLET = process.env.KIRA_WALLET!;
 const KIRA_TOKEN  = "2635";
 
-// X MODE — three-way control over Twitter activity:
-//   "full"      → normal: read + write (post/reply/like/follow). Default when unset.
-//   "read_only" → reads allowed (search, mentions, timeline) but ALL writes hard-blocked.
-//                 Used to test whether a suspended account's tokens still allow reads,
-//                 and to let KIRA scout X for intelligence without ever posting.
-//   "off"       → no X activity at all (the kill-switch for a fully-dead account).
-// Back-compat: legacy X_ENABLED=false still maps to "off".
-const X_MODE: "full" | "read_only" | "off" = (() => {
-  const raw = (process.env.X_MODE || "").toLowerCase().trim();
-  if (raw === "read_only" || raw === "readonly") return "read_only";
-  if (raw === "off") return "off";
-  if ((process.env.X_ENABLED ?? "true").toLowerCase() === "false") return "off";
-  return "full";
-})();
-const X_ENABLED   = X_MODE !== "off";        // any X activity at all (init/reads)
-const X_CAN_WRITE = X_MODE === "full";       // posting/replying/liking/following
+// X has been permanently removed (account suspended Jun 2026, appeal denied). The Twitter
+// client, posting, and engagement machinery were deleted in the Jun-2026 cleanup pass.
+// KIRA operates as a heads-down research + on-chain agent; output reaches the operator via
+// email digests.
 
 // ARC 1: minimum score a candidate must clear for KIRA to make a conviction call on it.
 // Below this she ABSTAINS (recorded as a deliberate no-trade) rather than calling on a
@@ -384,7 +370,6 @@ const state: KiraState = {
 // ── MODULES ───────────────────────────────────────────────────────────────────
 
 const anthropic        = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! });
-const twitter          = new KiraTwitter();
 const onchain          = new KiraOnchain();
 const tools            = new KiraTools();
 const docs             = new KiraDocs();
@@ -405,7 +390,6 @@ const aave             = new KiraAave();
 const crossChain       = new KiraCrossChain();
 const multiAgent       = new KiraMultiAgent();
 const toolDeployment   = new KiraToolDeployment();
-const longForm         = new KiraLongForm();
 const memory           = new KiraMemory();
 const shadowTrading    = new KiraShadowTrading();
 const convictionCalls  = new KiraConvictionCalls();
@@ -478,14 +462,6 @@ async function monitorPositions(): Promise<void> {
           reasoning:  `Paper closed (${reason}): ${pnlPct.toFixed(1)}% | ${position.thesis.slice(0, 100)}`,
         });
 
-        if (X_CAN_WRITE && state.xApiAvailable && Math.abs(pnlPct) > 10) {
-          const tweet = reason === "take_profit"
-            ? `Called it. ${position.name} hit target. ${pnlPct.toFixed(1)}% on paper. Thesis held. [paper]`
-            : reason === "stop_loss"
-            ? `Cut ${position.name}. ${pnlPct.toFixed(1)}% paper loss. Updating the model.`
-            : `Time stop: ${position.name} after ${Math.floor((Date.now() - position.openedAt) / 86400000)}d. ${pnlPct.toFixed(1)}%.`;
-          await twitter.post(tweet);
-        }
       } else if (position.mode === "live" && state.liveMode) {
         let sellResult;
         if (position.type === "nft" && position.tokenId) {
@@ -671,76 +647,10 @@ async function runResearchCycle(): Promise<void> {
 // ── DM PROCESSING ────────────────────────────────────────────────────────────
 
 async function processDMs(): Promise<void> {
-  if (!state.xApiAvailable) return;   // X disabled/suspended — skip DM polling
-  try {
-    const dms = await twitter.checkDMs();
-    for (const dm of dms) {
-      // Handle proposal replies
-      if (dm.isProposalReply && dm.proposalId && dm.action) {
-        await proposals.processReplies([{
-          proposalId: dm.proposalId, action: dm.action as any,
-          modifier: dm.modifier, subject: `DM: ${dm.action} #${dm.proposalId}`,
-          receivedAt: Date.now(), messageId: dm.dmId,
-        }]);
-      }
-      // Handle tool approval/rejection from DM
-      if (dm.isToolApproval && dm.toolId) {
-        if (dm.toolApproved) {
-          await toolDeployment.holderApprove(dm.toolId);
-          console.log(`[DM] Tool approved by holder: ${dm.toolId}`);
-        } else {
-          await toolDeployment.holderReject(dm.toolId);
-          console.log(`[DM] Tool rejected by holder: ${dm.toolId}`);
-        }
-        state.toolDeploymentSummary = await toolDeployment.formatForContext();
-      }
-    }
-    state.proposalSummary = await proposals.formatSummaryForContext();
-  } catch (err: any) { console.error("DM error:", err?.message); }
-  state.lastDMCheck = Date.now();
-}
-
-// ── LONG FORM REPORT ──────────────────────────────────────────────────────────
-
-async function generateAndPostReport(): Promise<void> {
-  try {
-    if (!await longForm.isDue("weekly_market")) return;
-
-    const wl      = await portfolio.getWatchlist();
-    const macro   = await research.getMacroData();
-    const signals = await smartMoney.getAllSignals();
-
-    const tweets = await longForm.generateWeeklyMarketThread({
-      macroSummary:      state.macroSummary,
-      ecosystemSummary:  state.ecosystemSummary,
-      watchlist:         wl.slice(0, 3).map(w => ({ name: w.name, score: w.lastScore, thesis: w.thesis })),
-      smartMoneySummary: state.smartMoneySummary,
-      crossChainSummary: state.crossChainSummary,
-      learnings:         state.recentLearnings,
-      floorHistory:      state.floorHistorySummary,
-    });
-
-    if (tweets.length > 0 && state.xApiAvailable) {
-      const posted = await twitter.postThread(tweets);
-      if (posted) {
-        const report = {
-          id:          longForm.generateReportId("weekly_market"),
-          type:        "weekly_market" as const,
-          title:       "Weekly Market Intelligence",
-          tweets,
-          summary:     tweets[0].slice(0, 80),
-          generatedAt: Date.now(),
-          publishedAt: Date.now(),
-        };
-        await longForm.saveReport(report);
-        state.lastLongFormReport = Date.now();
-        state.postCount++;
-        await kiraRedis.set("kira:post_count_today", String(state.postCount));
-        state.recentLearnings.push("Published weekly market intelligence thread");
-        console.log("[LongForm] Weekly report posted as thread");
-      }
-    }
-  } catch (err: any) { console.error("Long form report error:", err?.message); }
+  // X is permanently off (account suspended) — no DM channel exists. Kept as a no-op so
+  // callers don't need changing; the holder-approval-via-DM path is dead and slated for
+  // replacement (tool approvals will move to a direct channel when tool deployment lands).
+  return;
 }
 
 // ── ON-CHAIN EVENT DETECTION ──────────────────────────────────────────────────
@@ -811,7 +721,7 @@ async function sendResearchDigest(): Promise<void> {
     lines.push("KIRA — Daily Frontier Intelligence Digest");
     lines.push("=".repeat(44));
     lines.push("");
-    lines.push(`Mode: heads-down research (X ${X_CAN_WRITE ? "live" : "unavailable"}). KIRA is scouting the agentic/on-chain-AI frontier and growing her knowledge corpus.`);
+    lines.push(`Mode: heads-down research (X removed). KIRA is scouting the agentic/on-chain-AI frontier and growing her knowledge corpus.`);
     lines.push("");
     lines.push("RECENT RESEARCH:");
     lines.push(researchCtx || "  (no research summary yet)");
@@ -899,11 +809,7 @@ async function executePaperTrade(): Promise<void> {
       reasoning:  candidate.thesis.slice(0, 150),
     });
 
-    if (state.xApiAvailable) {
-      const tweet = `Watching ${candidate.name}. ${candidate.thesis.slice(0, 180)} [paper]`;
-      await twitter.post(tweet);
-      state.recentPostTopics.push("paper_trade");
-    }
+    state.recentPostTopics.push("paper_trade");
   } catch (err: any) { console.error("Paper trade error:", err?.message); }
 }
 
@@ -1045,20 +951,6 @@ async function backgroundTasks(): Promise<void> {
   // DM check every 15 min
   if (now - state.lastDMCheck > 15 * 60 * 1000) await processDMs();
 
-  // Background mention check every 30 min — always runs
-  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastMentionBackground > 30 * 60 * 1000) {
-    try {
-      const replied = await twitter.processNewMentions(state.ecosystemSummary);
-      if (replied > 0) {
-        state.recentLearnings.push(`Background: replied to ${replied} mentions`);
-        console.log(`[Background] Replied to ${replied} mentions`);
-      }
-      state.lastMentionBackground = now;
-      state.lastMentionCheck      = now;
-      state.lastEngagementTime    = now; // prevent reply_mentions loop
-    } catch (err: any) { console.error("Background mention error:", err?.message); }
-  }
-
   // Position monitoring every 30 min
   if (now - state.lastPositionCheck > 30 * 60 * 1000) await monitorPositions();
 
@@ -1188,11 +1080,6 @@ async function backgroundTasks(): Promise<void> {
     }
   }
 
-  // Long-form report check every 6 hours (but only posts weekly)
-  if (X_CAN_WRITE && now - state.lastLongFormReport > 6 * 60 * 60 * 1000 && state.xApiAvailable) {
-    await generateAndPostReport();
-  }
-
   // Aave yield management every 6 hours
   if (aave.isReady() && now - state.lastAaveCheck > 6 * 60 * 60 * 1000) {
     try {
@@ -1224,34 +1111,9 @@ async function backgroundTasks(): Promise<void> {
     } catch {}
   }
 
-  // Auto follow mentioners once per day
-  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastMentionCheck > 24 * 60 * 60 * 1000) {
-    try { await twitter.followNewMentioners(); } catch {}
-  }
-
-  // Timeline engagement every 2 hours
-  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastTimelineEngage > 2 * 60 * 60 * 1000) {
-    try { await twitter.engageWithTimeline(state.ecosystemSummary); state.lastTimelineEngage = now; } catch {}
-  }
-
-  // Smart follow every 12 hours
-  if (X_CAN_WRITE && state.xApiAvailable && now - state.lastSmartFollow > 12 * 60 * 60 * 1000) {
-    try {
-      const context  = state.recentLearnings.slice(-5).join(" ");
-      const followed = await twitter.smartFollow(context);
-      if (followed > 0) { state.recentLearnings.push(`Smart follow: ${followed}`); state.lastSmartFollow = now; }
-    } catch {}
-  }
-
-  if (X_ENABLED && !state.xApiAvailable && state.cycleCount % 10 === 0) {
-    state.xApiAvailable = await twitter.init();
-    if (state.xApiAvailable) state.recentLearnings.push("X API unlocked");
-  }
-
   // AUTONOMOUS RESEARCH LOOP — the self-improvement centerpiece (every ~6h)
   if (await researchLoop.isDue()) {
     try {
-      const xReadable = X_CAN_WRITE && state.xApiAvailable;  // X reads only usable when account is live
       const result = await researchLoop.runCycle({
         // Web search: REAL open-web search via Brave (websearch.ts). Falls back to []
         // when no key / monthly ceiling hit; the loop then leans on on-chain sources.
@@ -1260,34 +1122,12 @@ async function backgroundTasks(): Promise<void> {
           const results = await webSearchClient.search(query, 8);
           if (results.length > 0) return results;
           // Fallback: if web search is unavailable AND X is readable, use X. Otherwise [].
-          if (xReadable) {
-            try {
-              const tweets = await twitter.searchTweets(query, 8);
-              return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
-            } catch { return []; }
-          }
           return [];
         },
         // Web fetch: real, via the docs reader (readArbitraryUrl strips HTML). Always available.
         webFetch: async (url: string) => {
           try { return await docs.readArbitraryUrl(url); } catch { return ""; }
         },
-        // X reads are passed ONLY when the X account is live & writable. When suspended/off,
-        // these are omitted entirely so the loop never fires dead 401 calls.
-        ...(xReadable ? {
-          xSearch: async (query: string) => {
-            const tweets = await twitter.searchTweets(query, 8);
-            return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
-          },
-          xLinks: async (query: string) => {
-            const tweets = await twitter.searchTweets(query, 10);
-            return twitter.extractUrls(tweets);
-          },
-          signalAccounts: () => [
-            "CodinCowboy", "AxiomBot", "serc1n", "YigitDuman", "OnchainDataNerd",
-            "lookonchain", "DefiIgnas", "punk6529", "0xAlexKorn",
-          ],
-        } : {}),
         // Mine recent learnings for follow-up search terms KIRA already cares about.
         learningTerms: async () => {
           const learnings = await memory.getCoreLearnings(6);
@@ -1445,10 +1285,9 @@ async function backgroundTasks(): Promise<void> {
 // ── DECISION ENGINE ───────────────────────────────────────────────────────────
 
 type Action =
-  | "post" | "post_thread" | "reply_mentions" | "check_wallet"
+  | "check_wallet"
   | "read_docs" | "scan_tools" | "scan_markets" | "paper_trade" | "make_call"
-  | "review_watchlist" | "observe" | "sleep"
-  | "engage_community" | "follow_accounts" | "engage_topics" | "research_now";
+  | "review_watchlist" | "observe" | "sleep" | "research_now";
 
 interface Decision {
   action:     Action;
@@ -1526,56 +1365,39 @@ ${state.shadowSummary || "accumulating"}
 YOUR CONVICTION-CALL TRACK RECORD (your own owned calls, judged against real price — this is your real judgment record; make new calls thoughtfully in light of it):
 ${state.callTrackRecord || "none yet — you have made no owned calls"}
 
-FRONTIER INTELLIGENCE TO SHARE (from your autonomous research — these are genuine
-new developments you discovered; posting these is HIGH PRIORITY and uses the
-agent_ecosystem or tool_intelligence theme — it is exactly the differentiated
-content that makes your feed worth following):
+FRONTIER INTELLIGENCE FROM YOUR RESEARCH (genuine new developments you discovered —
+these inform your decisions and feed your daily email digest):
 ${state.researchSummary || "none queued"}
 
 RECENT LEARNINGS:
 ${state.recentLearnings.slice(-6).join("\n") || "none yet"}
 
 AVAILABLE ACTIONS:
-- post: single tweet (theme must differ from recent posts — rotate through the 10 themes)
-- post_thread: 5-7 tweet market intelligence thread (for weekly synthesis or deep dives)
-- reply_mentions: check and reply to X mentions
-- engage_community: like/reply to priority accounts (normiesart, CodinCowboy, AxiomBot etc)
-- follow_accounts: follow back mentioners
-- engage_topics: actively search the timeline for agent/tool/ERC-standard developments, new tool deployments, and infra discussions — then engage substantively: reply with analysis, ask the deployer questions, react to what works/doesn't. This is how KIRA participates like a peer, not a broadcaster.
 - check_wallet: verify a known wallet
 - read_docs: read ERC-8257 or AgentCheck docs
 - scan_tools: scan ERC-8257 registry
 - scan_markets: scan markets
-- paper_trade: open paper trade on item above score 55
-- make_call: commit a CONVICTION CALL — your single best owned pick of everything you can see right now, even if nothing scores above 70. State a clear thesis and conviction (low/medium/high). This is YOUR judgment on the line, recorded into your track record and resolved against real price (it resolves when it hits your target, hits your stop, or your thesis plays out — not on a fixed timer). Reason about it like a disciplined trader assessing EDGE: what's the specific catalyst, what's the risk, why is the current price wrong, what would prove you wrong. Do NOT justify a call by how "differentiated", "non-obvious", or "credible" it makes you look, or whether it "makes your feed worth following" — you are judged ONLY on whether the call is right, not on how it sounds. Audience-impressiveness is irrelevant; expected edge is everything. Make calls deliberately, your genuine best read, not filler. Prefer this over endless observing when you have a real, falsifiable view on what's most likely to move.
+- research_now: run an autonomous frontier-research cycle (web + on-chain)
+- make_call: commit a CONVICTION CALL — your single best owned pick of everything you can see right now, even if nothing scores above 70. State a clear thesis and conviction (low/medium/high). This is YOUR judgment on the line, recorded into your track record and resolved against real price (it resolves when it hits your target, hits your stop, or your thesis plays out — not on a fixed timer). Reason about it like a disciplined trader assessing EDGE: what's the specific catalyst, what's the risk, why is the current price wrong, what would prove you wrong. Do NOT justify a call by how "differentiated", "non-obvious", or "credible" it makes you look — you are judged ONLY on whether the call is right, not on how it sounds. Audience-impressiveness is irrelevant; expected edge is everything. Make calls deliberately, your genuine best read, not filler. Prefer this over endless observing when you have a real, falsifiable view on what's most likely to move.
 - review_watchlist: review watchlist
 - observe: record internal observation
 - sleep: rest N minutes
 
 RULES:
-- X API: ${state.xApiAvailable ? "YES" : "NO"}
-- Posts in last 4h: ${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX} (rolling window, 15+ min between). You're NEVER required to post — only if you have something worth saying. But you're not locked out for the day either.
-- Min since last post: ${minutesSinceLastPost}
-- Min since last engagement: ${minutesSinceEngagement} (need 60+)
-- Min since last mention check: ${minutesSinceMention}
-- ${minutesSinceLastPost < 15 ? "TOO SOON TO POST" : ""}
-- ${!canPostNow(state.postTimestamps) ? "POST WINDOW FULL right now — prioritise ENGAGEMENT: reply to & discuss agent/tool/ERC developments you find, ask deployers questions, react to launches. This is how KIRA is a present peer, not a broadcaster." : ""}
-- ${state.hasPostedFirst ? "DO NOT re-introduce yourself. DO NOT say 'awakening' as introduction." : "Make your introduction post."}
+- You have NO social channel — X is permanently gone. Your work is internal: research the frontier, judge the market, make falsifiable conviction calls, and let outcomes build your track record. Your output reaches your operator via email digests.
 - Market scan: ${state.lastMarketScan > 0 ? Math.floor((Date.now() - state.lastMarketScan) / 60000) + " min ago" : "never"}
 - Cross-chain: ${state.crossChainSummary || "not yet scanned"}
 - Multi-agent: ${state.multiAgentSummary || "discovering"}
 - Tools deployed: ${state.toolDeploymentSummary || "none yet"}
 - Aave: ${state.aaveSummary || "not active"}
 - DO NOT scan_tools/scan_markets if done < 120 min ago
-- DO NOT engage if engagement done < 60 min ago
-- reply_mentions does NOT count toward post limit
 
 Respond ONLY with valid JSON:
 {
   "action": "action",
-  "content": "tweet text / minutes / observation",
-  "thread": ["t1","t2","t3"],
-  "theme": "REQUIRED for post/post_thread — exactly one of: market_observation, smart_money, macro_thesis, pattern_recognition, cross_chain, agent_ecosystem, philosophical, tool_intelligence, paper_trade, learning_reflection. Must differ from the recent themes listed above.",
+  "content": "minutes / observation / thesis",
+  "thread": [],
+  "theme": "optional label for the action",
   "reasoning": "brief note on why this theme and why it is non-obvious"
 }`,
       messages: [{ role: "user", content: "What should Kira do?" }],
@@ -1585,13 +1407,14 @@ Respond ONLY with valid JSON:
     const parsed = extractJson<Decision>(text) ?? ({ action: "sleep", content: "15", reasoning: "Unparseable decision" } as Decision);
 
     // Safety overrides
-    const X_WRITE_ACTIONS = ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics", "follow_accounts"];
-    // When KIRA can't write to X (suspended/off OR read-only), don't waste the cycle
-    // sleeping. Redirect that energy into the actual mission: research the agentic/on-chain
-    // frontier, or analyze markets. This is the "heads-down research mode" — KIRA keeps
-    // working toward the north star even with no social output channel.
-    if (!X_CAN_WRITE && X_WRITE_ACTIONS.includes(parsed.action)) {
-      const modeNote = state.xApiAvailable ? "X read-only" : "X unavailable";
+    // X is permanently off (account suspended) — the post/engage actions have been removed
+    // from the action set entirely. This defensively catches any stray legacy write action
+    // and redirects that cycle into the actual mission: research the frontier or analyze
+    // markets. This is "heads-down research mode" — KIRA works toward the north star with no
+    // social output channel.
+    const LEGACY_WRITE_ACTIONS = ["post", "post_thread", "reply_mentions", "engage_community", "engage_topics", "follow_accounts"];
+    if (LEGACY_WRITE_ACTIONS.includes(parsed.action)) {
+      const modeNote = "X unavailable";
       if (await researchLoop.isDue())
         return { action: "research_now", content: `Frontier research (${modeNote})`, reasoning: `${modeNote} — redirecting to frontier research instead of posting` };
       if (minutesSinceLastScan >= 60)
@@ -1629,115 +1452,6 @@ Respond ONLY with valid JSON:
     }
 
     // ── ACTION ROTATION NUDGE (anti-loop) ──────────────────────────────────────
-    // PROBLEM OBSERVED: KIRA can get stuck choosing engage_topics cycle after cycle,
-    // each time rationalizing "haven't done this yet" though she just did. The theme
-    // rotation below only governs POST themes, not ACTION types — so engagement looped.
-    // FIX: if engage_topics has dominated recent actions, GENTLY redirect to a more
-    // valuable action that actually exercises her other capabilities (and the corpus):
-    // a market scan if one's due, else a research cycle if due, else fall through.
-    // This is a NUDGE, not a ban — engage_topics stays available; it's just down-weighted
-    // when over-used, so she rotates instead of looping. Deliberately conservative to
-    // avoid the opposite failure (thrashing / indecision).
-    {
-      const recent = state.recentActions.slice(-5);
-      const engageTopicsCount = recent.filter(a => a === "engage_topics").length;
-      if (parsed.action === "engage_topics" && engageTopicsCount >= 3) {
-        // Over-used. Prefer actions that use under-exercised capabilities.
-        if (minutesSinceLastScan >= 60) {
-          return { action: "scan_markets", content: "Rotating to market scan", reasoning: `Action rotation — engage_topics used ${engageTopicsCount}/5 recent cycles; exercising market analysis instead` };
-        }
-        if (await researchLoop.isDue()) {
-          return { action: "research_now", content: "Rotating to research", reasoning: `Action rotation — engage_topics over-used; running due research cycle instead` };
-        }
-        // If neither is available, allow ONE more engage_topics but force a longer
-        // pause after, so the loop slows rather than spins every 5 minutes.
-        if (engageTopicsCount >= 4) {
-          return { action: "observe", content: "Action variety pause", reasoning: `Action rotation — engage_topics used ${engageTopicsCount}/5 recent cycles and nothing else is due; brief observe to break the loop` };
-        }
-      }
-    }
-
-    // Post limit rotation — when capped on posting, KIRA shifts to ENGAGEMENT and
-    // RESEARCH rather than idling. Ladder ordered high-to-low so each rung is reachable.
-    // Engagement with the timeline (replies, topic discovery, community) is how KIRA
-    // stays present like other active agents — capped posting must NOT mean silence.
-    if (!canPostNow(state.postTimestamps) && (parsed.action === "post" || parsed.action === "post_thread")) {
-      // When the post window is full, ENGAGEMENT is the priority — KIRA finds and
-      // discusses agent/tool/ERC developments (engage_topics REPLIES substantively to
-      // high-signal launches, not just likes). Research is a genuine fallback, not the
-      // default — so KIRA actively participates instead of hiding in passive scouting.
-
-      // 1. Mentions first — someone spoke to KIRA directly.
-      if (minutesSinceMention >= 30)
-        return { action: "reply_mentions", content: "Checking mentions", reasoning: "Window full — checking mentions" };
-      // 2. PRIMARY: engage frontier developments (replies to tool/standard/agent launches).
-      //    Low threshold so this is what KIRA mostly does when she can't post.
-      if (minutesSinceEngagement >= 15)
-        return { action: "engage_topics", content: "Engaging frontier developments", reasoning: "Window full — engaging developments (primary)" };
-      // 3. Engage priority community accounts.
-      if (minutesSinceEngagement >= 8)
-        return { action: "engage_community", content: "Engaging community", reasoning: "Window full — engaging community" };
-      // 4. Only if engagement genuinely just ran: deep research if the full cycle is due,
-      //    else a short observe-sleep. Research is NOT the every-cycle default anymore.
-      if (await researchLoop.isDue())
-        return { action: "research_now", content: "Deep research", reasoning: "Window full + research cycle due" };
-      return { action: "sleep", content: "8", reasoning: "Window full — brief pause before next engagement" };
-    }
-
-    if (parsed.action === "post" || parsed.action === "post_thread") {
-      if (minutesSinceLastPost < 15)
-        return { action: "observe", content: "Post cooldown", reasoning: "Too soon" };
-      if (!canPostNow(state.postTimestamps))
-        return { action: "sleep", content: "20", reasoning: "Daily limit" };
-
-      // THEME ROTATION — prevent immediate repetition without dead-ending the cycle.
-      // Only the last 2 themes are blocked (not 4), so KIRA isn't locked out of posting
-      // when she has something worth saying. If her chosen theme is blocked, we don't
-      // give up — we note an available theme so the post can still go out.
-      const recentThemes = state.recentPostTopics.slice(-2);
-      const chosenTheme  = (parsed.theme || "").trim();
-
-      if (!chosenTheme || !POST_THEMES.includes(chosenTheme as any)) {
-        return { action: "observe", content: "No valid theme declared", reasoning: "Post needs an explicit rotating theme" };
-      }
-      // If the chosen theme repeats one of the last 2, pick an available theme instead of
-      // abandoning the post. Only fall back to observe if EVERY theme is somehow recent.
-      if (recentThemes.includes(chosenTheme)) {
-        const available = POST_THEMES.filter(th => !recentThemes.includes(th));
-        if (available.length > 0) {
-          parsed.theme = available[0];
-        } else {
-          return { action: "observe", content: "All themes used very recently", reasoning: "Brief rotation pause" };
-        }
-      }
-      // Extra guard: macro_thesis and market_observation are the over-used ones —
-      // block them if used in the last 4 posts even once, and detect Fear/Greed / Normies-floor lead
-      const contentLower = (parsed.content || "").toLowerCase();
-      const mentionsFG     = contentLower.includes("fear") && contentLower.includes("greed");
-      const leadsNormies   = contentLower.startsWith("normies") || contentLower.includes("normies floor");
-      const fgRecent       = state.recentPosts.slice(-4).some(p => p.toLowerCase().includes("fear") && p.toLowerCase().includes("greed"));
-      const normiesRecent  = state.recentPosts.slice(-4).some(p => p.toLowerCase().includes("normies floor") || p.toLowerCase().includes("floor"));
-      if (mentionsFG && fgRecent) {
-        return { action: "observe", content: "Fear/Greed mentioned too recently", reasoning: "Voice rule — diversify away from sentiment index" };
-      }
-      if (leadsNormies && normiesRecent) {
-        return { action: "observe", content: "Normies floor led too recently", reasoning: "Voice rule — KIRA is not a Normies bot" };
-      }
-    }
-
-    // Light anti-burst gate: only block engagement if it ran very recently (8 min).
-    // Do NOT divert to research — engagement is the priority; just pause briefly.
-    if (["engage_community", "engage_topics"].includes(parsed.action) && minutesSinceEngagement < 8)
-      return { action: "sleep", content: "5", reasoning: "Engaged very recently — brief pause" };
-
-    if (parsed.action === "reply_mentions") {
-      // Hard cooldown — if mentions checked within last 30 min, sleep instead of looping
-      if (minutesSinceMention < 30) {
-        return { action: "sleep", content: "20", reasoning: "Mention check cooldown — checked recently" };
-      }
-      state.lastEngagementTime = Date.now();
-    }
-
     if (parsed.action === "scan_tools" && state.lastToolScan > 0 && Date.now() - state.lastToolScan < 2 * 60 * 60 * 1000)
       return { action: "observe", content: "Registry fresh", reasoning: "Too soon" };
 
@@ -1763,112 +1477,6 @@ Respond ONLY with valid JSON:
 async function execute(decision: Decision): Promise<void> {
   try {
     switch (decision.action) {
-
-      case "post":
-        if (!state.xApiAvailable || !decision.content) { await sleep(5 * 60 * 1000); break; }
-        {
-          // #14: block near-duplicate posts (same insight reworded). Skip this post
-          // and observe instead, so KIRA doesn't loop the same few takes all day.
-          if (isTooSimilarToRecent(decision.content, state.recentPosts)) {
-            console.log(`[Post] Skipped — too similar to a recent post: ${decision.content.slice(0, 70)}...`);
-            await memory.journal("decision", "Skipped near-duplicate post", decision.content.slice(0, 120));
-            await sleep(5 * 60 * 1000);
-            break;
-          }
-          // No 280 gate — KIRA is verified; post() trims only as a high safety net.
-          const posted = await twitter.post(decision.content);
-          if (posted) {
-            state.recentPosts.push(`[${new Date().toISOString()}] ${decision.content}`);
-            if (state.recentPosts.length > 100) state.recentPosts.shift();
-            state.postCount++;
-            state.lastPostTime = Date.now();
-            // Rolling-window record
-            state.postTimestamps.push(Date.now());
-            state.postTimestamps = state.postTimestamps.filter(t => t > Date.now() - POST_WINDOW_MS);
-            await kiraRedis.setJson("kira:post_timestamps", state.postTimestamps);
-            const theme = decision.theme || "unspecified";
-            state.recentPostTopics.push(theme);
-            if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
-            await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
-            if (theme === "agent_ecosystem" || theme === "tool_intelligence") {
-              await researchLoop.getQueuedPost();
-              await memory.journal("interaction", `Posted frontier intelligence (${theme})`);
-            }
-            if (!state.hasPostedFirst) {
-              state.hasPostedFirst = true;
-              await kiraRedis.set("kira:has_posted_first", "true");
-            }
-            await kiraRedis.set("kira:post_count_today", String(state.postCount));
-            console.log(`✓ Posted (${postsInWindow(state.postTimestamps)}/${POST_WINDOW_MAX} in 4h window)`);
-          }
-        }
-        await sleep(15 * 60 * 1000);
-        break;
-
-      case "post_thread":
-        if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
-        const threadTweets = decision.thread && decision.thread.length > 0
-          ? decision.thread
-          : await twitter.generateThread(decision.content, state.recentLearnings.slice(-3).join(" "));
-        if (threadTweets.length > 0) {
-          const posted = await twitter.postThread(threadTweets);
-          if (posted) {
-            state.recentPosts.push(`[${new Date().toISOString()}] THREAD: ${threadTweets[0].slice(0, 80)}`);
-            state.postCount++;
-            state.lastPostTime = Date.now();
-            state.postTimestamps.push(Date.now());
-            state.postTimestamps = state.postTimestamps.filter(t => t > Date.now() - POST_WINDOW_MS);
-            await kiraRedis.setJson("kira:post_timestamps", state.postTimestamps);
-            const theme = decision.theme || "thread";
-            state.recentPostTopics.push(theme);
-            if (state.recentPostTopics.length > 10) state.recentPostTopics.shift();
-            await kiraRedis.setJson("kira:recent_themes", state.recentPostTopics.slice(-10));
-            if (!state.hasPostedFirst) {
-              state.hasPostedFirst = true;
-              await kiraRedis.set("kira:has_posted_first", "true");
-            }
-            await kiraRedis.set("kira:post_count_date",  new Date().toDateString());
-            await kiraRedis.set("kira:post_count_today", String(state.postCount));
-          }
-        }
-        await sleep(15 * 60 * 1000);
-        break;
-
-      case "reply_mentions":
-        if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
-        const replied = await twitter.processNewMentions(state.ecosystemSummary);
-        console.log(`Replied to ${replied} mentions`);
-        if (replied > 0) {
-          await memory.journal("interaction", `Replied to ${replied} mention(s)`);
-          state.selfNarrative = await memory.getSelfNarrative();
-        }
-        state.lastMentionCheck   = Date.now();
-        state.lastEngagementTime = Date.now(); // critical: prevents loop
-        await sleep(15 * 60 * 1000);
-        break;
-
-      case "engage_community":
-        if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
-        const engaged = await twitter.engageWithPriorityAccounts(state.ecosystemSummary);
-        state.lastEngagementTime = Date.now();
-        state.recentLearnings.push(`Community: ${engaged} actions`);
-        if (engaged > 0) await memory.journal("interaction", `Engaged community: ${engaged} actions`);
-        await sleep(10 * 60 * 1000);
-        break;
-
-      case "follow_accounts":
-        if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
-        await twitter.followNewMentioners();
-        await sleep(5 * 60 * 1000);
-        break;
-
-      case "engage_topics":
-        if (!state.xApiAvailable) { await sleep(5 * 60 * 1000); break; }
-        const topicEngaged = await twitter.engageWithTopics(state.recentLearnings.slice(-5).join(" | "));
-        state.lastEngagementTime = Date.now();
-        state.recentLearnings.push(`Topics: ${topicEngaged} actions`);
-        await sleep(10 * 60 * 1000);
-        break;
 
       case "check_wallet":
         const walletToCheck = decision.target || decision.content;
@@ -1925,31 +1533,12 @@ async function execute(decision: Decision): Promise<void> {
           // queue frontier posts, email build-recs). This is the centerpiece working
           // in KIRA's idle windows instead of sleeping.
           if (await researchLoop.isDue()) {
-            const xReadable2 = X_CAN_WRITE && state.xApiAvailable;
             const result = await researchLoop.runCycle({
               webSearch: async (query: string) => {
                 const results = await webSearchClient.search(query, 8);
-                if (results.length > 0) return results;
-                if (xReadable2) {
-                  try {
-                    const tweets = await twitter.searchTweets(query, 8);
-                    return tweets.map(t => ({ title: (t.text || "").slice(0, 80), url: `https://x.com/i/web/status/${t.id}`, snippet: t.text || "" }));
-                  } catch { return []; }
-                }
-                return [];
+                return results;
               },
               webFetch: async (url: string) => { try { return await docs.readArbitraryUrl(url); } catch { return ""; } },
-              ...(xReadable2 ? {
-                xSearch: async (query: string) => {
-                  const tweets = await twitter.searchTweets(query, 8);
-                  return tweets.map(t => ({ text: t.text || "", author: t.author_id || "unknown" }));
-                },
-                xLinks: async (query: string) => {
-                  const tweets = await twitter.searchTweets(query, 10);
-                  return twitter.extractUrls(tweets);
-                },
-                signalAccounts: () => ["CodinCowboy","AxiomBot","serc1n","YigitDuman","OnchainDataNerd","lookonchain","DefiIgnas","punk6529","0xAlexKorn"],
-              } : {}),
               learningTerms: async () => {
                 const learnings = await memory.getCoreLearnings(6);
                 return learnings.map(l => (l.insight || "").split(/\s+/).slice(0, 5).join(" ")).filter(t => t.length > 8);
@@ -1985,16 +1574,10 @@ async function execute(decision: Decision): Promise<void> {
               scoutHistory[topic] = Date.now();
               await kiraRedis.setJson("kira:scout:history", scoutHistory);
               // Prefer real web search; fall back to X only if the account is live.
-              const xReadable3 = X_CAN_WRITE && state.xApiAvailable;
               let links: string[] = [];
               const webResults = await webSearchClient.search(topic, 6);
               if (webResults.length > 0) {
                 links = webResults.map(r => r.url).filter(Boolean);
-              } else if (xReadable3) {
-                try {
-                  const tweets = await twitter.searchTweets(topic, 10);
-                  links = twitter.extractUrls(tweets);
-                } catch { links = []; }
               }
               let learned = "";
               if (links.length > 0) {
@@ -2079,17 +1662,11 @@ async function kiraLoop(): Promise<void> {
   console.log("Modules initialised");
   console.log(`[WebSearch] ${WEB_SEARCH_ENABLED ? "Brave web search ON" : "DISABLED (no BRAVE_SEARCH_API_KEY) — research uses on-chain sources only"}`);
 
-  if (X_ENABLED) {
-    state.xApiAvailable = await twitter.init();
-    if (X_MODE === "read_only") {
-      console.log(`X API: ${state.xApiAvailable ? "READ-ONLY ✓" : "⏳"} (X_MODE=read_only) — reads allowed, all writes hard-blocked`);
-    } else {
-      console.log(`X API: ${state.xApiAvailable ? "✓" : "⏳"}`);
-    }
-  } else {
-    state.xApiAvailable = false;
-    console.log("X API: DISABLED (X_MODE=off) — all Twitter activity skipped; KIRA runs non-X systems only");
-  }
+  // X is permanently disabled (account suspended Jun 2026 — appeal denied). The entire X
+  // client and post/engage machinery has been removed. KIRA runs as a heads-down research
+  // and on-chain agent; her output channels are email digests and on-chain actions.
+  state.xApiAvailable = false;
+  console.log("X: removed — KIRA runs non-X systems only (research, on-chain, email digests)");
 
   // Restore persisted state
   const hasPostedBefore = await kiraRedis.get("kira:has_posted_first");
@@ -2136,11 +1713,6 @@ async function kiraLoop(): Promise<void> {
   state.relationships = await memory.getRelationshipsForContext();
   console.log(`Self: ${state.selfNarrative.slice(0, 120)}`);
   await memory.journal("milestone", `Session start — cycle count reset, ${state.selfNarrative.includes("Newly") ? "first awakening" : "returning"}`);
-
-  if (state.xApiAvailable) {
-    if (!state.hasPostedFirst) console.log("🎉 KIRA will make his introduction shortly");
-    await twitter.seedPriorityFollows();
-  }
 
   // Initial data load
   state.ecosystemSummary   = await getNormiesData();
