@@ -1355,6 +1355,52 @@ Respond ONLY with valid JSON:
     const text   = response.content[0].type === "text" ? response.content[0].text : "{}";
     const parsed = extractJson<Decision>(text) ?? ({ action: "sleep", content: "15", reasoning: "Unparseable decision" } as Decision);
 
+    // ── make_call LOOP-BREAKER ──────────────────────────────────────────────────
+    // When KIRA directly chooses make_call but she's at max open calls (or on anti-burst
+    // cooldown), the call would just be SKIPPED — and she tends to re-choose make_call every
+    // single cycle, looping uselessly at 8/8. (This replaces the action-rotation nudge that
+    // lived in the now-removed X-engagement block.) Instead of letting her loop, redirect the
+    // capped cycle into something productive: due research, an overdue scan, else a brief
+    // observe. She is NOT blocked from calling once a slot frees — this only catches the
+    // can't-call-right-now case so she stops spinning.
+    if (parsed.action === "make_call") {
+      const gate = await convictionCalls.cooldownStatus();
+      if (!gate.canCall) {
+        // At capacity (or cooldown). Before redirecting away, see if this is a clearly-better
+        // setup that should DISPLACE the weakest eligible open call (opportunity-cost
+        // reallocation). Only fires when at the max-open cap (not for anti-burst/per-asset),
+        // and only when the new setup is genuinely dominant — see tryDisplace gates.
+        if (gate.openCount >= 8) {
+          const dwl = await portfolio.getWatchlist();
+          const dbest = dwl.length ? [...dwl].sort((a, b) => (b.lastScore || 0) - (a.lastScore || 0))[0] : null;
+          if (dbest && (dbest.lastScore || 0) >= CALL_MIN_SCORE) {
+            // Derive conviction the SAME way executeConvictionCall does, so the displacement
+            // gate reflects how the new call will actually be recorded (≥65 high, ≥52 medium).
+            const sc = dbest.lastScore || 0;
+            const newConv: "high" | "medium" | "low" = sc >= 65 ? "high" : sc >= 52 ? "medium" : "low";
+            const disp = await convictionCalls.tryDisplace(
+              { score: sc, conviction: newConv },
+              async (c) => {
+                try {
+                  if (c.type === "nft") { const col = await nfts.getCollection(c.address, c.chain); return col?.floorPrice ?? null; }
+                  const p = await prices.getTokenPrice(c.address, c.chain); return p?.priceNative ?? null;
+                } catch { return null; }
+              }
+            );
+            if (disp.displaced) {
+              console.log(`[Call] Displacement: ${disp.note}`);
+              return parsed;   // slot freed — let make_call proceed
+            }
+          }
+        }
+        if (await researchLoop.isDue())
+          return { action: "research_now", content: "Frontier research", reasoning: `At call capacity (${gate.reason}) — redirecting to due research instead of re-attempting a capped call` };
+        if (minutesSinceLastScan >= 90)
+          return { action: "scan_markets", content: "Market scan", reasoning: `At call capacity (${gate.reason}) — redirecting to market scan instead of re-attempting a capped call` };
+        return { action: "observe", content: "Holding — at call capacity", reasoning: `At call capacity (${gate.reason}); letting open calls resolve before making new ones` };
+      }
+    }
+
     // Safety overrides
     // X is permanently off (account suspended) — the post/engage actions have been removed
     // from the action set entirely. This defensively catches any stray legacy write action
