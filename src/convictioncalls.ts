@@ -59,7 +59,7 @@ export interface ConvictionCall {
   exitTime?:    number;
   pnlPct?:      number;
   outcome?:     "win" | "loss" | "flat";
-  resolveReason?: "target_hit" | "stop_hit" | "horizon" | "max_age_forced" | "unpriceable_forced";
+  resolveReason?: "target_hit" | "stop_hit" | "horizon" | "max_age_forced" | "unpriceable_forced" | "displaced";
   resolveNote?: string;
 }
 
@@ -81,6 +81,7 @@ const K = {
   counter: ()           => `kira:calls:counter`,
   lastCall:()           => `kira:calls:lastts`,     // global anti-burst pacing
   assetLast:(addr: string) => `kira:calls:asset:${(addr||"").toLowerCase()}`, // per-asset cooldown
+  displaceLog:()        => `kira:calls:displace_log`,  // timestamps of recent displacements (anti-churn)
 };
 
 // Cadence guards — keep calls DELIBERATE without artificially capping good ideas.
@@ -111,6 +112,18 @@ const FLAT_BAND_PCT      = 2;     // |pnl| < 2% counts as "flat", not win/loss
 // tracked asset is a mis-scaled/near-zero price, not a real move. Don't let it pollute
 // the track record.
 const MAX_PLAUSIBLE_ABS_PNL_PCT = 500;
+
+// ── DISPLACEMENT (opportunity-cost reallocation) ──────────────────────────────
+// When KIRA is at capacity (MAX_OPEN_CALLS), a CLEARLY-better new setup may close the
+// weakest eligible open call and take its slot — rehearsing capital allocation in paper
+// before real budget arrives at #12. Deliberately STRICT/rare: all gates must pass, and
+// at most one displacement per day. The failure mode we guard against (churn — abandoning
+// theses mid-flight, conviction calls becoming day-trades) is worse than occasionally
+// missing a better setup, so every knob biases toward NOT displacing.
+const DISPLACE_REQUIRE_HIGH   = (process.env.DISPLACE_REQUIRE_HIGH ?? "true") !== "false"; // only HIGH-conviction new calls can displace
+const DISPLACE_SCORE_MARGIN   = parseFloat(process.env.DISPLACE_SCORE_MARGIN || "10");     // new score ≥ weakest-open score + this
+const DISPLACE_MIN_HOLD_MS    = parseInt(process.env.DISPLACE_MIN_HOLD_MS  || String(24 * 60 * 60 * 1000)); // a call is protected for 24h UNLESS it's losing
+const DISPLACE_MAX_PER_DAY    = parseInt(process.env.DISPLACE_MAX_PER_DAY  || "1");        // anti-churn: at most N displacements per rolling 24h
 
 export class KiraConvictionCalls {
 
@@ -153,6 +166,92 @@ export class KiraConvictionCalls {
       }
     }
     return { canCall: true, reason: "clear", openCount };
+  }
+
+  // ── DISPLACEMENT — opportunity-cost reallocation ────────────────────────────
+  // Called ONLY when KIRA is at capacity and wants to make a new call. Decides whether the
+  // new setup is clearly better than her weakest ELIGIBLE open call; if so, closes that call
+  // at current price (booking real P&L into the track record, reason="displaced") to free a
+  // slot. Returns { displaced, note }. Deliberately strict — all gates must pass:
+  //   GATE 1: new call must be HIGH conviction (if DISPLACE_REQUIRE_HIGH).
+  //   GATE 2: new score ≥ weakest-eligible-open score + DISPLACE_SCORE_MARGIN.
+  //   GATE 3: the displaced call must be ELIGIBLE — past min-hold OR already losing.
+  //           (Young AND winning calls are protected so patient theses can resolve.)
+  //   + anti-churn: at most DISPLACE_MAX_PER_DAY displacements per rolling 24h.
+  async tryDisplace(
+    candidate: { score: number; conviction: "high" | "medium" | "low" },
+    priceLookup: (c: ConvictionCall) => Promise<number | null>
+  ): Promise<{ displaced: boolean; note: string }> {
+    // GATE 1: conviction
+    if (DISPLACE_REQUIRE_HIGH && candidate.conviction !== "high") {
+      return { displaced: false, note: "no displacement — new call isn't high-conviction (slots reserved for best ideas)" };
+    }
+    // Anti-churn: daily limit
+    const now = Date.now();
+    const log = (await kiraRedis.getJson<number[]>(K.displaceLog()) || []).filter(t => t > now - 24 * 60 * 60 * 1000);
+    if (log.length >= DISPLACE_MAX_PER_DAY) {
+      return { displaced: false, note: `no displacement — daily limit reached (${log.length}/${DISPLACE_MAX_PER_DAY} in last 24h)` };
+    }
+
+    const openIds = await kiraRedis.getJson<string[]>(K.open()) || [];
+    if (openIds.length < MAX_OPEN_CALLS) return { displaced: false, note: "not at capacity — no displacement needed" };
+
+    // Gather open calls with current price + eligibility.
+    const candidates: Array<{ call: ConvictionCall; price: number | null; pnl: number | null; eligible: boolean }> = [];
+    for (const id of openIds) {
+      const call = await kiraRedis.getJson<ConvictionCall>(K.call(id));
+      if (!call || call.resolved) continue;
+      let price: number | null = null;
+      try { price = await priceLookup(call); } catch { price = null; }
+      const pnl = price !== null ? this.safePnlPct(call.entryPrice, price) : null;
+      const age = now - call.entryTime;
+      // GATE 3: eligible if past min-hold OR currently losing. Young AND (winning or flat) = protected.
+      const losing = pnl !== null && pnl < 0;
+      const eligible = age >= DISPLACE_MIN_HOLD_MS || losing;
+      candidates.push({ call, price, pnl, eligible });
+    }
+
+    const eligible = candidates.filter(c => c.eligible);
+    if (eligible.length === 0) {
+      return { displaced: false, note: "no displacement — all open calls are young and not losing (protected to let theses resolve)" };
+    }
+
+    // Pick the WEAKEST eligible: lowest conviction first, then worst current P&L.
+    const convRank = (c: ConvictionCall) => c.conviction === "high" ? 2 : c.conviction === "medium" ? 1 : 0;
+    eligible.sort((a, b) => {
+      const cr = convRank(a.call) - convRank(b.call);
+      if (cr !== 0) return cr;                          // lower conviction first
+      return (a.pnl ?? 0) - (b.pnl ?? 0);               // then worst P&L first
+    });
+    const weakest = eligible[0];
+
+    // GATE 2: new setup must clearly out-score the weakest eligible open call.
+    if (candidate.score < weakest.call.score + DISPLACE_SCORE_MARGIN) {
+      return { displaced: false, note: `no displacement — new setup (${candidate.score}) doesn't clear weakest open ${weakest.call.name} (${weakest.call.score}) by +${DISPLACE_SCORE_MARGIN}` };
+    }
+
+    // All gates passed — CLOSE the weakest at current price (book real P&L into the record).
+    const wc = weakest.call;
+    wc.resolved   = true;
+    wc.exitTime   = now;
+    wc.resolveReason = "displaced";
+    if (weakest.price !== null && weakest.pnl !== null) {
+      wc.exitPrice = weakest.price;
+      wc.pnlPct    = weakest.pnl;
+      wc.outcome   = weakest.pnl > FLAT_BAND_PCT ? "win" : weakest.pnl < -FLAT_BAND_PCT ? "loss" : "flat";
+      wc.resolveNote = `displaced by a higher-conviction setup (score ${candidate.score} vs ${wc.score}); closed at ${weakest.pnl >= 0 ? "+" : ""}${weakest.pnl.toFixed(1)}%`;
+    } else {
+      // Unpriceable at displacement time — book flat, excluded from P&L, but still freed.
+      wc.pnlPct = 0; wc.outcome = "flat";
+      wc.resolveNote = `displaced (unpriceable at close) by higher-conviction setup score ${candidate.score} vs ${wc.score}`;
+    }
+    await kiraRedis.setJson(K.call(wc.id), wc);
+    await kiraRedis.setJson(K.open(), openIds.filter(id => id !== wc.id));
+    log.push(now);
+    await kiraRedis.setJson(K.displaceLog(), log);
+
+    const pnlStr = weakest.pnl !== null ? `${weakest.pnl >= 0 ? "+" : ""}${weakest.pnl.toFixed(1)}%` : "n/a";
+    return { displaced: true, note: `displaced ${wc.name} (${wc.conviction}, ${pnlStr}, score ${wc.score}) for new high-conviction setup (score ${candidate.score})` };
   }
 
   // ── RECORD a conviction call (KIRA's owned decision) ────────────────────────
