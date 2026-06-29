@@ -792,36 +792,44 @@ async function executeConvictionCall(decision: Decision): Promise<void> {
       return;
     }
 
-    // Walk down to the best candidate that clears the floor and isn't on per-asset cooldown.
+    // Walk down the ranked list to the best candidate that (a) clears the floor, (b) isn't
+    // on per-asset cooldown, AND (c) can actually be PRICED. Previously selection and pricing
+    // were separate: the top candidate was chosen, then if it couldn't be priced the whole
+    // call failed and returned — so a single unpriceable asset stuck at the top of the
+    // watchlist (e.g. a dead token like "SHROOM" with no price feed) jammed EVERY call attempt
+    // indefinitely. Now we price inline and skip unpriceable names, dropping them from the
+    // watchlist so they stop clogging the queue.
     let candidate = null as (typeof ranked)[number] | null;
+    let entryPrice = 0;
     for (const cand of ranked) {
-      if ((cand.lastScore || 0) < CALL_MIN_SCORE) break;  // rest are below floor
+      if ((cand.lastScore || 0) < CALL_MIN_SCORE) break;        // rest are below floor
       const g = await convictionCalls.cooldownStatus(cand.address);
-      if (g.canCall) { candidate = cand; break; }
+      if (!g.canCall) continue;                                 // on cooldown — try next
+      // Try to price it.
+      let px = 0;
+      try {
+        if (cand.type === "nft") { const col = await nfts.getCollection(cand.address, cand.chain); px = col?.floorPrice || 0; }
+        else { const p = await prices.getTokenPrice(cand.address, cand.chain); px = p?.priceNative || 0; }
+      } catch { px = 0; }
+      if (!px) {
+        // Unpriceable — drop from watchlist so it stops jamming the queue, and try next.
+        console.log(`[Call] Skipping unpriceable candidate: ${cand.name} (dropped from watchlist)`);
+        try { await portfolio.removeFromWatchlist(cand.key); } catch {}
+        continue;
+      }
+      candidate = cand; entryPrice = px; break;
     }
     if (!candidate) {
-      // Either nothing clears the floor, or all qualifying names are on per-asset cooldown.
       const best = ranked[0];
       if (best && (best.lastScore || 0) >= CALL_MIN_SCORE) {
-        console.log(`[Call] Skipped — qualifying setups on per-asset cooldown`);
-        state.recentLearnings.push("Call held: best setups already called recently");
+        console.log(`[Call] Skipped — qualifying setups on cooldown or unpriceable`);
+        state.recentLearnings.push("Call held: best setups already called recently or unpriceable");
       } else {
         await convictionCalls.recordAbstention(best ? best.lastScore || 0 : 0, `best available ${best?.name || "none"} @ ${best?.lastScore ?? 0} below floor ${CALL_MIN_SCORE}`);
         state.recentLearnings.push(`Abstained: nothing clears floor ${CALL_MIN_SCORE} (best ${best?.lastScore ?? 0})`);
       }
       return;
     }
-
-    // Price it.
-    let entryPrice = 0;
-    if (candidate.type === "nft") {
-      const col = await nfts.getCollection(candidate.address, candidate.chain);
-      entryPrice = col?.floorPrice || 0;
-    } else {
-      const price = await prices.getTokenPrice(candidate.address, candidate.chain);
-      entryPrice = price?.priceNative || 0;
-    }
-    if (!entryPrice) { console.log(`[Call] Could not price ${candidate.name}`); return; }
 
     // Conviction from score: deliberately conservative mapping. Low market → low/medium.
     const conviction: "low" | "medium" | "high" =
