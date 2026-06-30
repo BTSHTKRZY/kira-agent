@@ -172,6 +172,18 @@ function extractJson<T>(raw: string): T | null {
       }
     }
   }
+  // TRUNCATION REPAIR: we reached end-of-string with depth>0 (the LLM response was cut off
+  // mid-object — the cause of "Unparseable decision" falling back to sleep). Try to repair:
+  // close an open string, then close all open braces, and parse the salvaged object. Better
+  // to recover a partial decision than waste a 15-min cycle on a sleep fallback.
+  if (depth > 0) {
+    let repaired = s.slice(start);
+    if (inStr) repaired += '"';                 // close an unterminated string
+    // strip a dangling trailing comma / colon (common truncation point)
+    repaired = repaired.replace(/[,:]\s*$/, "");
+    repaired += "}".repeat(depth);              // close all open objects
+    try { return JSON.parse(repaired) as T; } catch { /* fall through */ }
+  }
   return null;
 }
 
