@@ -278,18 +278,22 @@ function arc3Weight(prevWeight: number, n: number, avgYield: number, overallAvg:
 }
 
 function runArc3Goldens() {
-  console.log("\nGOLDEN SET 5 — Arc 3 sample gate");
+  console.log("\nGOLDEN SET 5 — Arc 3 sample gate (item-level belief learning)");
 
-  golden("below gate (n<8): weight stays neutral, inactive (no thrash)", () => {
+  golden("below gate (n<8): belief weight stays neutral, inactive (no thrash)", () => {
     const r = arc3Weight(1.0, 5, -20, -5);
     eq(r.weight, 1.0, "must not move below sample gate");
     eq(r.active, false, "inactive below gate");
   });
-  golden("at/above gate: weight moves SLOWLY toward yield-implied target", () => {
-    const r = arc3Weight(1.0, 10, -20, -5); // underperforming source
+  golden("at/above gate: belief weight moves SLOWLY toward yield-implied target", () => {
+    const r = arc3Weight(1.0, 10, -20, -5); // underperforming belief
     assert(r.weight < 1.0, "underperformer moves down");
     assert(r.weight > 0.85, "but only ONE slow step, not a violent swing");
     eq(r.active, true, "active above gate");
+  });
+  golden("a belief BEATING baseline gets up-weighted", () => {
+    const r = arc3Weight(1.0, 12, 15, 2); // belief avg +15 vs base +2 → should rise
+    assert(r.weight > 1.0, "outperforming belief up-weighted");
   });
   golden("weights never exceed [0.5, 1.5] bounds even after many updates", () => {
     let w = 1.0;
