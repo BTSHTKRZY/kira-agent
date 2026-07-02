@@ -1218,13 +1218,15 @@ async function backgroundTasks(): Promise<void> {
     try {
       const kRetrieval = await knowledge.getRelevantKnowledgeWithItems(relevanceContext, "main_cycle");
       // ARC 3: re-rank retrieved items by learned source weight — favor sources that have
-      // historically led to good calls. Weights are neutral (1.0) until a source passes the
-      // sample gate, so this is a no-op until there's enough resolved-call data to mean
-      // something. Re-ranking only reorders WHICH retrieved items lead; it doesn't fabricate.
+      // ARC 3 (item-level): re-rank retrieved items by learned BELIEF weight — favor the
+      // specific beliefs that have historically led to good calls. Weights are neutral (1.0)
+      // until a belief passes the sample gate, so this is a no-op until there's enough
+      // resolved-call data per belief. Re-ranking only reorders WHICH retrieved items lead;
+      // it doesn't fabricate or inject anything.
       let items = kRetrieval.items;
       try {
         const weighted = await Promise.all(items.map(async (it) => ({
-          it, w: await sourceLearning.weightFor(it.source),
+          it, w: await sourceLearning.weightFor(it.id),   // keyed on item id, not source
         })));
         weighted.sort((a, b) => b.w - a.w);
         items = weighted.map(x => x.it);
