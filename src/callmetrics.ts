@@ -66,6 +66,7 @@ export interface QualityReport {
     interpretation:   string;
   };
   sourceYields:    SourceYield[];
+  itemYields:      SourceYield[];
   convictionCalibration: {
     high:   GroupStat;
     medium: GroupStat;
@@ -143,6 +144,21 @@ export class KiraCallMetrics {
       };
     }).sort((a, b) => b.avgPnlPct - a.avgPnlPct);
 
+    // ── ITEM (BELIEF) YIELD — Arc 3 item-level: which specific beliefs lead to good calls ──
+    // This is the useful view: not "which source" (nearly all seed) but which SPECIFIC
+    // trading beliefs (extreme-fear-contrarian, BTC-dominance-altseason, ...) actually yield.
+    const byItem: Record<string, ConvictionCall[]> = {};
+    for (const c of resolved) {
+      if (c.attribution?.degraded === true) continue;
+      for (const id of (c.attribution?.knowledgeIds || [])) {
+        (byItem[id] ||= []).push(c);
+      }
+    }
+    const itemYields: SourceYield[] = Object.entries(byItem).map(([itemId, calls]) => {
+      const g = statFromCalls(calls);
+      return { source: itemId, n: g.n, wins: g.wins, losses: g.losses, avgPnlPct: g.avgPnlPct, winRate: g.winRate, confidence: confidenceLabel(g.n) };
+    }).sort((a, b) => b.avgPnlPct - a.avgPnlPct);
+
     // ── CONVICTION CALIBRATION ────────────────────────────────────────────────
     const high   = statFromCalls(resolved.filter(c => c.conviction === "high"));
     const medium = statFromCalls(resolved.filter(c => c.conviction === "medium"));
@@ -175,6 +191,7 @@ export class KiraCallMetrics {
       overall,
       knowledgeLift: { withKnowledge: gWith, withoutKnowledge: gWithout, liftPct, interpretation: liftInterp },
       sourceYields,
+      itemYields,
       convictionCalibration: { high, medium, low, interpretation: convInterp },
       caveat,
     };
@@ -206,13 +223,24 @@ export class KiraCallMetrics {
       }
     }
     L.push("");
+    L.push("BELIEF YIELD (which specific trading beliefs lead to good calls? — Arc 3 item-level):");
+    if (report.itemYields.length === 0) {
+      L.push("  (no resolved calls citing knowledge items yet)");
+    } else {
+      for (const s of report.itemYields.slice(0, 10)) {
+        L.push(`  ${s.source}: ${s.n} calls, win ${(s.winRate*100).toFixed(0)}%, avg ${s.avgPnlPct>=0?"+":""}${s.avgPnlPct.toFixed(1)}% — ${s.confidence}`);
+      }
+      L.push("  (beliefs beating the overall average get up-weighted in retrieval once past the sample gate;");
+      L.push("   laggards get down-weighted. Correlated beliefs (retrieved as a bundle) make this slow to sharpen.)");
+    }
+    L.push("");
     L.push("CONVICTION CALIBRATION (do her 'high' calls beat her 'low' calls?):");
     L.push(`  high:   ${pct(report.convictionCalibration.high)}`);
     L.push(`  medium: ${pct(report.convictionCalibration.medium)}`);
     L.push(`  low:    ${pct(report.convictionCalibration.low)}`);
     L.push(`  → ${report.convictionCalibration.interpretation}`);
     L.push("");
-    L.push("(Arc 3 will use source-yield to steer what KIRA reads and retrieves. Until the");
+    L.push("(Arc 3 uses BELIEF-yield (item-level) to steer what KIRA retrieves. Until the");
     L.push(" sample grows, these are observations, not yet inputs to any automated change.)");
     return L.join("\n");
   }
